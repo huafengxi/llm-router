@@ -1,0 +1,9 @@
+# the deployment's own pool config (copy accounts.example.yml to start)
+accounts.yml
+
+# probe / test scratch (never leave the machine)
+.test-tmp/
+.probe-out/
+
+__pycache__/
+*.pyc

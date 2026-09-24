@@ -1,0 +1,89 @@
+# accounts.example.yml — reference shape of the llm-router pool configuration.
+#
+# Copy to accounts.yml (gitignored) and edit, or point the router at your own
+# file: `router.py --accounts /path/to/accounts.yml` (the LLM_ROUTER_ACCOUNTS
+# environment variable works too). The file is hot-reloaded on mtime change; a
+# reload that fails validation is REFUSED — the previous config stays in effect
+# and a CONFIG_REJECTED line is logged.
+#
+# THIS FILE MUST NOT CONTAIN ANY CREDENTIAL. Every secret is referenced as
+# {env_file, var} and decrypted at runtime by secrets.py through the decryptor
+# (LLM_ROUTER_ENVDEC, default <ws>/encrypt/envdec.py). `env_file` is relative to
+# LLM_ROUTER_WS (default: this repo's parent directory) or absolute. A missing
+# env_file is a load error, not a warning.
+#
+# THE WRITING ORDER OF THE `accounts:` LIST IS THE ROTATION ORDER (`order`,
+# 1-based): a request walks the list top-down and switches to the next account
+# whenever the current account is at fault. To try an account earlier, move its
+# block up. Exhaustion is decided ONLY by the upstream signal (judgement table =
+# classify.py). Pool state lives in process memory and a restart resets every
+# blacklist; per-request detail goes to the log (stdout).
+#
+# A block carrying one of the retired keys (`priority` / `quota` /
+# `credits_weights`) is refused: a stale file must not be able to quietly change
+# the rotation order.
+
+# ---- pool-level defaults ----
+defaults:
+  blacklist_exhausted: 3600       # quota / arrears class: how long such an account is
+                                  # skipped (seconds). Recovery is lazy: the first
+                                  # request after the deadline expires is the probe.
+  blacklist_failure: 20           # everything else that is the account's fault: rate
+                                  # limit, 5xx, unknown status, network error,
+                                  # unresolvable key, upstream 401 (refused credential)
+  timeout: {connect: 60, read: 300}
+                                  # `connect` is NOT just the TCP/TLS handshake: it bounds
+                                  # handshake + sending the request body + waiting for the
+                                  # response headers (time-to-first-byte); `read` then
+                                  # bounds the streamed body only. A TTFB overrun surfaces
+                                  # as a read timeout and is classified server_error ->
+                                  # next account + short blacklist.
+                                  # Per-account override: a `timeout:` key in that block.
+  inject_stream_options: true     # stream requests get stream_options.include_usage so
+                                  # the log reports real token counts; if the upstream
+                                  # answers 400 the field is dropped and the same account
+                                  # is retried once (that request is logged
+                                  # usage_source=missing)
+
+# ---- inbound auth ----
+# Every endpoint except `exempt_paths` requires `Authorization: Bearer <token>`;
+# the comparison is constant-time and a 401 never echoes the expected value.
+# /health stays open because a liveness probe sends no credential — its payload
+# is therefore limited to liveness + a pool summary (no key, no token, no
+# account names, no usage figures).
+auth:
+  token: {env_file: env/router.env, var: ROUTER_TOKEN}
+  exempt_paths: [/health]
+
+# ---- the pool, in rotation order ----
+accounts:
+  # `models:` maps the name clients ask for -> the name THIS upstream expects.
+  # An account serves only the names it maps: a client-side alias (here `fast`
+  # and `big`) lets one pool name reach a different upstream model per seat, and
+  # a seat that does not map a name simply drops out of that name's candidate
+  # set (`/v1/models` reports `reason: no_mapping`).
+  - name: acme-payg
+    base_url: https://api.acme.example/v1
+    key: {env_file: env/acme.env, var: ACME_API_KEY}
+    models:
+      fast: acme-small-v1
+      big: acme-large-v1
+
+  - name: acme-team
+    base_url: https://team.acme.example/v1
+    key: {env_file: env/acme-team.env, var: ACME_TEAM_API_KEY}
+    models:
+      fast: acme-small-v1
+      big: acme-large-v2
+    timeout: {connect: 20, read: 120}   # per-account override
+
+  # Last resort: a metered account with no hard quota, so the pool always has a
+  # candidate left (there is no fallback outside the pool). It invents no pool
+  # name of its own — every name it maps is also mapped by an earlier account,
+  # so removing this block changes no client-visible name.
+  - name: fallback-metered
+    base_url: https://metered.acme.example/v1
+    key: {env_file: env/acme-metered.env, var: ACME_METERED_API_KEY}
+    models:
+      fast: acme-small-v1
+      big: acme-large-v1

@@ -1379,7 +1379,11 @@ class TestSecretsUnit(unittest.TestCase):
         self.s = secrets_mod.Secrets(self.env)
 
     def test_mask_shapes(self):
-        self.assertEqual("sk-sp-****wxyz", secrets_mod.mask("sk-sp-abcdefghijklmnopqrstuvwxyz"))
+        # neutral placeholder family (the file's own FAKE_KEYS shape), not a real
+        # provider prefix: a literal prefix family here is a standing false
+        # positive for any "no credential material" sweep over this repo
+        self.assertEqual("sk-fake-****wxyz",
+                         secrets_mod.mask("sk-fake-abcdefghijklmnopqrstuvwxyz"))
         self.assertEqual("sk-fake-****1111", secrets_mod.mask(FAKE_KEYS["a"]))
         self.assertEqual("****babe", secrets_mod.mask(FAKE_TOKEN))
         self.assertEqual("(empty)", secrets_mod.mask(""))

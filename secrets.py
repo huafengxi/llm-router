@@ -1,39 +1,44 @@
 """secrets.py — the single choke point for every plaintext credential.
 
-Nothing else in this package may invoke the decryptor or hold a plaintext
-API key / router token.  Everything that leaves the process (log lines, HTTP
-response bodies) is passed through mask()/redact() first, so a credential can
-never be transcribed in clear.
+Credentials are **environment variables, referenced by name**: accounts.yml says
+`key: ACME_API_KEY` and this module reads `os.environ["ACME_API_KEY"]`. How a
+deployment obtains those values (a plaintext env, an inline-encrypted file
+decrypted at spawn, a secret store, a shell wrapper) is deliberately **not this
+package's business** — it spawns no decryptor, reads no credential file and
+knows no cipher format. Whoever starts the router puts the values in its
+environment; `require_env`-style gates belong to that launcher, not here.
 
-Plaintext values live only in this object's in-memory cache (TTL + mtime based).
-The pool state that mask() feeds (`key_hint`) is in-memory too: the service
-persists nothing, so the only durable face a credential could reach is the log.
+Nothing else in this package may read a credential from the environment or hold
+a plaintext API key / router token. Everything that leaves the process (log
+lines, HTTP response bodies) is passed through mask()/redact() first, so a
+credential can never be transcribed in clear.
+
+Plaintext values live only in this object's `_known` registry (for redaction);
+the environment itself is fixed for the process lifetime, so there is nothing to
+cache and nothing to invalidate — which also means **rotating a credential is a
+restart**, not a hot reload.
 
 Python 3.8 syntax floor; stdlib only.
 """
 import hmac
 import os
 import re
-import subprocess
-import sys
 import threading
-import time
 
-DEFAULT_TTL = 300.0          # re-decrypt at most every N seconds per (file, var)
-DEC_TIMEOUT = 30             # bounded wait on the envdec.py subprocess
-VALUE_RE = re.compile(r"^([A-Za-z_]\w*)=(.*)$")
 # `sk-sp-`, `sk-`, `hf_`-style provider prefixes worth keeping in a mask
 PREFIX_RE = re.compile(r"^((?:[A-Za-z]{2,8}[-_]){1,2})")
 # defence in depth: anything that still looks like a provider key or a bearer
 # credential after the known-value pass gets masked too
 GENERIC_KEY_RE = re.compile(r"\b(sk-[A-Za-z0-9._-]{6,})\b")
 GENERIC_BEARER_RE = re.compile(r"((?i:bearer)\s+)([A-Za-z0-9._\-]{6,})")
+# what accounts.yml may name: a shell identifier, never a literal credential
+ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 class SecretError(RuntimeError):
-    """A credential could not be resolved (missing file, bad var, decrypt fail).
+    """A credential could not be resolved (unset/empty variable, bad name).
 
-    The message is safe to log: it carries paths and return codes only, and is
+    The message is safe to log: it carries variable NAMES and no value, and it is
     passed through redact() before it is built.
     """
 
@@ -52,104 +57,47 @@ def mask(value):
 
 
 class Secrets(object):
-    def __init__(self, ws_root, python=None, dec=None, ttl=DEFAULT_TTL):
-        self.ws = os.path.abspath(ws_root)
-        self.python = python or sys.executable
-        # Decryptor contract: `<python> <dec> <env-file>` prints the file's
-        # KEY=VALUE lines with every `enc1:`-prefixed value in clear (stdout
-        # only, nothing written). Default = <ws>/encrypt/envdec.py; point
-        # LLM_ROUTER_ENVDEC at any script honouring that contract.
-        self.dec = dec or os.environ.get("LLM_ROUTER_ENVDEC") \
-            or os.path.join(self.ws, "encrypt", "envdec.py")
-        self.ttl = ttl
+    def __init__(self, env=None):
+        """`env` defaults to os.environ; tests inject a dict instead."""
+        self.env = os.environ if env is None else env
         self._lock = threading.RLock()
-        self._cache = {}          # (env_file, var) -> [expires, value, mtime]
         self._known = {}          # plaintext -> mask, for redact()
-        self._token_source = None  # (env_file, var) of the inbound bearer token
+        self._token_name = None   # env var name of the inbound bearer token
 
     # ---------------- resolution ----------------
 
-    def _path(self, env_file):
-        return env_file if os.path.isabs(env_file) else os.path.join(self.ws, env_file)
-
-    def _decrypt_file(self, path):
-        try:
-            r = subprocess.run([self.python, self.dec, path],
-                               stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                               timeout=DEC_TIMEOUT)
-        except subprocess.TimeoutExpired:
-            raise SecretError("envdec.py timed out after %ss for %s"
-                              % (DEC_TIMEOUT, path))
-        except OSError as e:
-            raise SecretError("envdec.py could not be executed for %s: %s"
-                              % (path, type(e).__name__))
-        if r.returncode != 0:
-            err = self.redact(r.stderr.decode("utf-8", "replace")).strip()
-            raise SecretError("envdec.py failed for %s (rc=%s): %s"
-                              % (path, r.returncode, err[:200]))
-        return r.stdout.decode("utf-8", "replace")
-
     @staticmethod
-    def _parse_env(text):
-        """KEY=VALUE lines (optional `export `, optional matching quotes)."""
-        out = {}
-        for line in text.splitlines():
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            if line.startswith("export "):
-                line = line[len("export "):].strip()
-            m = VALUE_RE.match(line)
-            if not m:
-                continue
-            v = m.group(2).strip()
-            if len(v) >= 2 and v[0] == v[-1] and v[0] in ("'", '"'):
-                v = v[1:-1]
-            out[m.group(1)] = v
-        return out
+    def check_name(name):
+        """True when `name` is usable as an environment-variable name."""
+        return bool(name) and bool(ENV_NAME_RE.match(str(name).strip()))
 
-    def resolve(self, env_file, var):
-        """Plaintext value of `var` in `env_file` (decrypted in memory, cached)."""
-        if not env_file or not var:
-            raise SecretError("secret source incomplete (env_file=%r var=%r)"
-                              % (bool(env_file), bool(var)))
-        key = (env_file, var)
-        path = self._path(env_file)
-        now = time.time()
-        with self._lock:
-            hit = self._cache.get(key)
-        try:
-            mtime = os.path.getmtime(path)
-        except OSError:
-            raise SecretError("secret env file missing: %s" % env_file)
-        if hit is not None and hit[2] == mtime and hit[0] > now:
-            return hit[1]
-        values = self._parse_env(self._decrypt_file(path))
-        if var not in values:
-            raise SecretError("variable %s not found in %s (has: %d var(s))"
-                              % (var, env_file, len(values)))
-        value = values[var]
-        if not value:
-            raise SecretError("variable %s in %s is empty" % (var, env_file))
-        with self._lock:
-            self._cache[key] = [now + self.ttl, value, mtime]
-            self._known[value] = mask(value)
+    def resolve(self, name):
+        """Plaintext value of the environment variable called `name`."""
+        if not name or not str(name).strip():
+            raise SecretError("credential name is empty (accounts.yml points at "
+                              "an environment variable by name)")
+        name = str(name).strip()
+        if name not in self.env:
+            raise SecretError("environment variable %s is not set — the "
+                              "deployment injects credentials into this process's "
+                              "environment (see README «Credentials»)" % name)
+        value = self.env[name]
+        if value is None or str(value) == "":
+            raise SecretError("environment variable %s is empty" % name)
+        value = str(value)
+        self.note(value)
         return value
-
-    def forget(self):
-        with self._lock:
-            self._cache.clear()
 
     # ---------------- inbound bearer token ----------------
 
-    def set_token_source(self, env_file, var):
-        self._token_source = (env_file, var)
+    def set_token_source(self, name):
+        self._token_name = name
 
     def router_token(self):
-        if not self._token_source:
+        if not self._token_name:
             raise SecretError("router token source not configured "
                               "(accounts.yml `auth.token`)")
-        return self.resolve(self._token_source[0], self._token_source[1])
+        return self.resolve(self._token_name)
 
     def token_hint(self):
         """Masked router token — safe for logs/README, never the value itself."""

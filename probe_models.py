@@ -13,12 +13,17 @@ mappings need topping up.  Accounts rarely expose the same set of upstream model
 names, so a blind repoint silently drops an account out of the candidate set
 (`/v1/models` reports `reason: no_mapping` and nothing warns).
 
-Read-only against the upstreams of the pool.  Credentials: decrypted in memory
-through the same decryptor contract as secrets.py (LLM_ROUTER_ENVDEC, default
-<ws>/encrypt/envdec.py); the key lives only in a python str and is injected into
-an Authorization header built in memory.  It is NEVER passed as argv, NEVER
-written to any file, NEVER printed (every persisted/echoed body goes through
-scrub()).
+Read-only against the upstreams of the pool.  Credentials: like router.py, this
+probe reads them **from its own environment by name** (accounts.yml `key:` is an
+environment-variable name) -- it spawns no decryptor and reads no credential
+file, so run it with the deployment's credentials injected, e.g.
+
+    set -a; eval "$(<the deployment's decrypt-or-export step>)"; set +a
+    python3 probe_models.py one ACCT MODEL
+
+The key lives only in a python str and is injected into an Authorization header
+built in memory.  It is NEVER passed as argv, NEVER written to any file, NEVER
+printed (every persisted/echoed body goes through scrub()).
 
 Usage:
   probe_models.py models [acct[,acct...]]    GET {base_url}/models
@@ -27,12 +32,12 @@ Usage:
   probe_models.py one ACCOUNT MODEL          single ad-hoc probe cell
 
 ACCOUNTS below is DERIVED from accounts.yml (the single source of the
-pool: name / base_url / key pointer, list order = rotation order) by
+pool: name / base_url / key env-var name, list order = rotation order) by
 _load_accounts() -- a minimal line scanner, because this script is stdlib-only
 and must not grow a PyYAML dependency.  Adding a seat to accounts.yml therefore
 makes it probeable with no edit here (no second table to keep in sync).  The
 scanner is deliberately LOUD: an unreadable file, a missing `accounts:` key, a
-zero-account result, an account missing name/base_url/env_file/var, a duplicate
+zero-account result, an account missing name/base_url/key, a duplicate
 name, or an unexpected indentation all exit non-zero with the reason -- it never
 returns a shorter table, because a silently missing account would make that seat
 unprobeable and read as "no such account".
@@ -42,23 +47,19 @@ stdlib only; python 3.8 syntax floor.  Serial, >=1.1s between calls.
 import json
 import os
 import re
-import subprocess
 import sys
 import time
 import urllib.error
 import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-# Same resolution rules as router.py: WS = the credential base (relative
-# `env_file:` paths and the decryptor default resolve against it).
-WS = os.environ.get("LLM_ROUTER_WS") or os.path.dirname(HERE)
-ENVDEC = os.environ.get("LLM_ROUTER_ENVDEC") or os.path.join(WS, "encrypt", "envdec.py")
 OUT = os.environ.get("LLM_ROUTER_PROBE_OUT") or os.path.join(HERE, ".probe-out")
 
 ACCOUNTS_YML = os.environ.get("LLM_ROUTER_ACCOUNTS") or os.path.join(HERE, "accounts.yml")
-# `key: {env_file: <path>, var: <NAME>}` -- the only credential shape accounts.yml
-# allows (a block with a literal value is refused by config.py before it gets here).
-KEY_INLINE_RE = re.compile(r"^\{\s*env_file:\s*([^,}]+?)\s*,\s*var:\s*([^}]+?)\s*\}$")
+# `key: <ENV_VAR_NAME>` -- the only credential shape accounts.yml allows (a mapping
+# is the retired file-pointer form and a literal value is refused by config.py
+# before it gets here).
+KEY_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 def _loud(path, lineno, why):
@@ -82,7 +83,7 @@ def _scalar(text):
 
 
 def _load_accounts(path):
-    """-> [(name, base_url, env_file, var), ...] in accounts.yml list order.
+    """-> [(name, base_url, key_env), ...] in accounts.yml list order.
 
     Minimal scanner for the three fields this probe needs; expects the file's
     present shape (top-level `accounts:`, account items at 2 spaces, their
@@ -114,7 +115,7 @@ def _load_accounts(path):
             if not name:
                 _loud(path, lineno, "empty account name")
             cur = {"name": name, "line": lineno,
-                   "base_url": None, "env_file": None, "var": None}
+                   "base_url": None, "key": None}
             out.append(cur)
             continue
         if cur is None:
@@ -124,10 +125,10 @@ def _load_accounts(path):
         if body.startswith("base_url:"):
             cur["base_url"] = _scalar(body[len("base_url:"):])
         elif body.startswith("key:"):
-            m = KEY_INLINE_RE.match(_scalar(body[len("key:"):]))
-            if not m:
-                _loud(path, lineno, "key: is not `{env_file: ..., var: ...}`")
-            cur["env_file"], cur["var"] = m.group(1), m.group(2)
+            cur["key"] = _scalar(body[len("key:"):])
+            if not KEY_NAME_RE.match(cur["key"] or ""):
+                _loud(path, lineno,
+                      "key: is not an environment-variable name ([A-Za-z_][A-Za-z0-9_]*)")
     if not seen_marker:
         _loud(path, 0, "no top-level `accounts:` key found")
     if not out:
@@ -137,13 +138,13 @@ def _load_accounts(path):
                      % (len(out), items))
     names = set()
     for cur in out:
-        for field in ("base_url", "env_file", "var"):
+        for field in ("base_url", "key"):
             if not cur[field]:
                 _loud(path, cur["line"], "account %s has no %s" % (cur["name"], field))
         if cur["name"] in names:
             _loud(path, cur["line"], "duplicate account name %s" % cur["name"])
         names.add(cur["name"])
-    return [(a["name"], a["base_url"], a["env_file"], a["var"]) for a in out]
+    return [(a["name"], a["base_url"], a["key"]) for a in out]
 
 
 ACCOUNTS = _load_accounts(ACCOUNTS_YML)
@@ -185,18 +186,14 @@ NOT_PURCHASED_HINTS = ("accessdenied.unpurchased", "unpurchased", "not purchased
                        "eligible for using the model", "未购买", "未开通")
 
 
-def get_key(env_file, var):
-    """Decrypt in memory; return the raw key str. Nothing written, nothing echoed."""
-    proc = subprocess.run([ENVDEC, os.path.join(WS, env_file)],
-                          capture_output=True, text=True)
-    for line in proc.stdout.splitlines():
-        line = line.strip()
-        if line.startswith("export "):
-            line = line[7:]
-        k, _, v = line.partition("=")
-        if k.strip() == var:
-            return v.strip().strip('"').strip("'")
-    raise SystemExit("key not found: %s/%s (rc=%d)" % (env_file, var, proc.returncode))
+def get_key(name):
+    """Value of the environment variable `name`. Nothing written, nothing echoed."""
+    value = os.environ.get(name)
+    if not value:
+        raise SystemExit("credential env var %s is not set (or empty) -- inject the "
+                         "deployment's credentials into this probe's environment"
+                         % name)
+    return value
 
 
 def scrub(text, key):
@@ -267,8 +264,8 @@ def append_result(rec):
 
 def do_models(names):
     for name in names:
-        acc, base, envf, var = BY_NAME[name]
-        key = get_key(envf, var)
+        acc, base, key_env = BY_NAME[name]
+        key = get_key(key_env)
         status, body = request(base.rstrip("/") + "/models", key)
         ids = []
         try:
@@ -302,8 +299,8 @@ def do_models(names):
 def do_probe(plan):
     total = 0
     for name, models in plan.items():
-        acc, base, envf, var = BY_NAME[name]
-        key = get_key(envf, var)
+        acc, base, key_env = BY_NAME[name]
+        key = get_key(key_env)
         skipped = None
         for model in models:
             if skipped:
@@ -340,8 +337,9 @@ USAGE = """usage:
   probe_models.py probe PLAN.json           按 plan 逐账号 chat/completions 实探（max_tokens=1）
   probe_models.py one ACCT MODEL            单笔实探
 账号名 = %s
-凭据经解密器内存解密（$LLM_ROUTER_ENVDEC，缺省 <ws>/encrypt/envdec.py；key 只进 str、
-不进 argv、不落盘、不打印）；产物落 %s（自动建目录，gitignored）。
+凭据 = 本进程环境里按名取（accounts.yml 的 `key:` 就是环境变量名；不 spawn 解密器、
+不读凭据文件 ⇒ 跑之前要先把部署面的凭据注入环境）；key 只进 str、不进 argv、
+不落盘、不打印。产物落 %s（自动建目录，gitignored）。
 
 注意：本探针把模型名原样发给上游，不套用 accounts.yml 的 `models:` 映射 ⇒
 用池角色档名（accounts.yml 里 `models:` 的那些别名）裸探恒得上游 404 `model_not_found`，
@@ -374,8 +372,8 @@ def main():
         do_probe(plan)
     elif mode == "one":
         name, model = sys.argv[2], sys.argv[3]
-        acc, base, envf, var = BY_NAME[name]
-        key = get_key(envf, var)
+        acc, base, key_env = BY_NAME[name]
+        key = get_key(key_env)
         body = {"model": model, "messages": [{"role": "user", "content": "hi"}],
                 "max_tokens": 1, "stream": False}
         status, text = request(base.rstrip("/") + "/chat/completions", key, body)

@@ -18,7 +18,8 @@ Python 3.8+ syntax floor, stdlib + PyYAML only.
 
 ```bash
 pip install pyyaml
-cp accounts.example.yml accounts.yml      # then edit: base_url, models, credentials
+cp accounts.example.yml accounts.yml      # then edit: base_url, models, key env-var names
+export ROUTER_TOKEN=... ACME_API_KEY=... ACME_TEAM_API_KEY=... ACME_METERED_API_KEY=...
 python3 router.py --host 127.0.0.1 --port 9200
 curl -s localhost:9200/health | python3 -m json.tool
 curl -s localhost:9200/v1/chat/completions \
@@ -39,10 +40,10 @@ effect and a `CONFIG_REJECTED` line is logged. `accounts.example.yml` is the
 annotated reference shape.
 
 Structure: `defaults:` (two blacklist windows, `timeout: {connect, read}`,
-`inject_stream_options`), `auth:` (inbound bearer token pointer + exempt paths),
-`accounts:` (the pool, in rotation order). Per-account keys: `name`, `base_url`,
-`key: {env_file, var}`, `models: {<pool name>: <upstream name>}`, optional
-`timeout:` / `ssl_verify:`.
+`inject_stream_options`), `auth:` (inbound bearer token env-var name + exempt
+paths), `accounts:` (the pool, in rotation order). Per-account keys: `name`,
+`base_url`, `key: <ENV_VAR_NAME>`, `models: {<pool name>: <upstream name>}`,
+optional `timeout:` / `ssl_verify:`.
 
 **Rotation order = writing order.** `order` is derived from the list position
 (1-based); there is no numeric field to edit and no local quota face. Move a
@@ -57,33 +58,49 @@ same upstream model may be pointed at by any number of pool names — that is ho
 role-style names (`planner`, `executor`, `utility`, …) are expressed: they are
 ordinary pool names, there is no separate alias mechanism.
 
-**No credential ever appears in this file.** Every secret is a
-`{env_file, var}` pointer, resolved at runtime by `secrets.py` — the single
-choke point. The decryptor contract is:
+## Credentials
 
-```
-<python> <decryptor> <env-file>    # prints that file's KEY=VALUE lines, with
-                                   # every encrypted value in clear, on stdout
-```
+**No credential ever appears in this file, and this repo never reads one from
+disk.** A credential is an **environment variable, referenced by name**
+(`key: ACME_API_KEY`, `auth: {token: ROUTER_TOKEN}`) and `secrets.py` — the
+single choke point — looks it up in the router's own environment. How a
+deployment obtains those values is deliberately not this package's business: it
+spawns no decryptor, knows no cipher format and opens no credential file, so a
+plaintext env, an inline-encrypted file decrypted by the launcher, a secret
+store or a shell wrapper all work unchanged.
 
-The default decryptor is `<ws>/encrypt/envdec.py` (`enc1:` inline encryption);
-point `LLM_ROUTER_ENVDEC` at any script honouring that contract, or at a
-plaintext KEY=VALUE file reader if your deployment stores credentials
-differently. Plaintext values live only in an in-memory TTL cache; everything
-that leaves the process (log lines, response bodies) passes through
-`mask()`/`redact()` first.
+A reference that is not an identifier is refused at load: the retired
+`{env_file:, var:}` mapping fails with a message that names the new form, and
+anything else (a pasted `sk-…` value) fails the identifier shape check — so a
+literal credential cannot be committed by accident.
+
+Two consequences of reading the environment instead of a file:
+
+- **Inject at spawn, and gate the start there.** The router logs a masked hint
+  per account at startup (`ACCOUNT … key=sk-****abcd`) and a `KEY_ERROR` line for
+  a name it cannot resolve, but the fail-loud gate belongs to the launcher (a
+  `require_env`-style list): a service must not come up without its credentials.
+- **Rotating a credential is a restart, not a hot reload.** The environment is
+  fixed for the process lifetime, so there is no TTL cache and nothing to
+  invalidate; editing `accounts.yml` stays hot-reloaded, editing a *value* does
+  not.
+
+Plaintext values live only in the process environment and in `secrets.py`'s
+redaction registry; everything that leaves the process (log lines, response
+bodies) passes through `mask()`/`redact()` first. After the refactor the router
+spawns **no subprocess at all**, so no child inherits the credentials either.
 
 | Environment variable | Meaning | Default |
 |---|---|---|
-| `LLM_ROUTER_WS` | credential base: relative `env_file:` paths and the decryptor resolve against it | the repo's parent directory |
 | `LLM_ROUTER_ACCOUNTS` | pool configuration path | `<repo>/accounts.yml` |
-| `LLM_ROUTER_ENVDEC` | decryptor script (contract above) | `<ws>/encrypt/envdec.py` |
 | `LLM_ROUTER_PROBE_OUT` | `probe_models.py` artifact directory | `<repo>/.probe-out` |
 | `LLM_ROUTER_TEST_TMP` | test scratch root | `<repo>/.test-tmp` |
 
+…plus one variable per credential named in `accounts.yml` (`probe_models.py`
+reads the same names from its own environment).
+
 CLI: `--host` (default `127.0.0.1` — loopback only), `--port` (9200),
-`--accounts`, `--log-level`, `--secret-ttl` (seconds a decrypted credential is
-cached, default 300).
+`--accounts`, `--log-level`.
 
 ## Inbound auth
 
@@ -111,8 +128,8 @@ the token strong and treat its disclosure as a rotation event.
 | anything else | 404 + JSON error (401 first when unauthenticated) |
 
 The `reason` values above are a **folded** public enumeration: the two
-credential classes (undecryptable key / upstream refusing our key) both surface
-as `key_error`, and the short-window transient class (throttle, 5xx, network
+credential classes (unresolvable key variable / upstream refusing our key) both
+surface as `key_error`, and the short-window transient class (throttle, 5xx, network
 error, unknown status) surfaces as `throttled` with the exact recovery instant
 in `until`. The folding table is an explicit constant (`pool.py::VIEW_REASON`),
 not a string coincidence.
@@ -238,9 +255,10 @@ no PyYAML) — a seat added there becomes probeable with no edit here. Buckets:
 `other` / `not_probed`; the first three are account-level facts and skip that
 account's remaining models, the rest are per-model facts and do not. Model names
 are sent verbatim, so probing a pool-side alias yields a 404 `model_not_found`
-that says nothing about the seat. Credentials are decrypted in memory and never
-reach argv, a file or the output (every persisted body goes through `scrub()`);
-artifacts land in `LLM_ROUTER_PROBE_OUT`.
+that says nothing about the seat. Credentials are read from this probe's own
+environment (same names as `accounts.yml`) and never reach argv, a file or the
+output (every persisted body goes through `scrub()`); artifacts land in
+`LLM_ROUTER_PROBE_OUT`.
 
 ## Tests
 
@@ -286,7 +304,7 @@ latency-based routing (the order is the policy).
 | `pool.py` | candidate selection, blacklists, lazy recovery, `/v1/models` + `/health` views |
 | `classify.py` | upstream outcome → reason judgement table (the only place wording is matched) |
 | `proxy.py` | upstream connection, streaming relay, empty-stream probe |
-| `secrets.py` | the single credential choke point: decrypt, TTL cache, `mask()`/`redact()` |
+| `secrets.py` | the single credential choke point: environment lookup by name, `mask()`/`redact()` |
 | `probe_models.py` | read-only per-account upstream probe (maintenance tool) |
 | `accounts.example.yml` | annotated reference configuration |
 | `test/` | verification matrix + mock upstream |

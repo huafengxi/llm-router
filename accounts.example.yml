@@ -6,11 +6,16 @@
 # reload that fails validation is REFUSED — the previous config stays in effect
 # and a CONFIG_REJECTED line is logged.
 #
-# THIS FILE MUST NOT CONTAIN ANY CREDENTIAL. Every secret is referenced as
-# {env_file, var} and decrypted at runtime by secrets.py through the decryptor
-# (LLM_ROUTER_ENVDEC, default <ws>/encrypt/envdec.py). `env_file` is relative to
-# LLM_ROUTER_WS (default: this repo's parent directory) or absolute. A missing
-# env_file is a load error, not a warning.
+# THIS FILE MUST NOT CONTAIN ANY CREDENTIAL. Every secret is referenced by the
+# NAME of an environment variable (`key: ACME_API_KEY`, `auth.token:
+# ROUTER_TOKEN`) and read from the router's own environment at runtime
+# (secrets.py). The router does not know — and deliberately does not try to
+# learn — how a deployment stores or decrypts those values: inject them at spawn
+# (a service manager's env hook, a shell wrapper, a secret-store agent) and gate
+# the start on their presence there. A reference that is not an identifier (a
+# pasted literal credential, or the retired `{env_file:, var:}` mapping) is a
+# load error, not a warning. Consequence: the environment is fixed at spawn, so
+# ROTATING A CREDENTIAL IS A RESTART, not a hot reload.
 #
 # THE WRITING ORDER OF THE `accounts:` LIST IS THE ROTATION ORDER (`order`,
 # 1-based): a request walks the list top-down and switches to the next account
@@ -52,7 +57,7 @@ defaults:
 # is therefore limited to liveness + a pool summary (no key, no token, no
 # account names, no usage figures).
 auth:
-  token: {env_file: env/router.env, var: ROUTER_TOKEN}
+  token: ROUTER_TOKEN
   exempt_paths: [/health]
 
 # ---- the pool, in rotation order ----
@@ -64,14 +69,14 @@ accounts:
   # set (`/v1/models` reports `reason: no_mapping`).
   - name: acme-payg
     base_url: https://api.acme.example/v1
-    key: {env_file: env/acme.env, var: ACME_API_KEY}
+    key: ACME_API_KEY
     models:
       fast: acme-small-v1
       big: acme-large-v1
 
   - name: acme-team
     base_url: https://team.acme.example/v1
-    key: {env_file: env/acme-team.env, var: ACME_TEAM_API_KEY}
+    key: ACME_TEAM_API_KEY
     models:
       fast: acme-small-v1
       big: acme-large-v2
@@ -83,7 +88,7 @@ accounts:
   # so removing this block changes no client-visible name.
   - name: fallback-metered
     base_url: https://metered.acme.example/v1
-    key: {env_file: env/acme-metered.env, var: ACME_METERED_API_KEY}
+    key: ACME_METERED_API_KEY
     models:
       fast: acme-small-v1
       big: acme-large-v1

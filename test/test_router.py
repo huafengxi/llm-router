@@ -7,8 +7,8 @@ Run (from the repo root):
 
 The end-to-end cases start `router.py` as a subprocess plus N mock upstreams on
 random high ports (never 9200, so a live service is untouched) and drive them
-with synthetic credentials only — no real key is decrypted and no real quota is
-spent. All waits are bounded; there is no unconditional wait anywhere.
+with synthetic credentials only — no real credential is read and no real quota
+is spent. All waits are bounded; there is no unconditional wait anywhere.
 
 Pool state is process memory only: the observable faces are `/v1/models`
 (available / reason / until), `/health` (pool / accounts_available), the router
@@ -62,6 +62,10 @@ TMP_ROOT = os.environ.get("LLM_ROUTER_TEST_TMP") or \
 
 # synthetic credentials — these strings must NEVER appear in a persisted face
 FAKE_KEYS = {"a": "sk-fake-aaaa1111", "b": "sk-fake-bbbb2222", "c": "sk-fake-cccc3333"}
+# credentials are environment variables, referenced by NAME from accounts.yml
+KEY_ENV = dict((k, "FAKE_KEY_%s" % k.upper()) for k in FAKE_KEYS)   # a/b/c -> FAKE_KEY_A…
+KEY_ENV_NAME = "K"          # the name unit-test configs point at
+TOKEN_ENV = "FAKE_ROUTER_TOKEN"
 FAKE_TOKEN = "deadbeefcafebabedeadbeefcafebabedeadbeefcafebabedeadbeefcafebabe"
 FAKE_MASKS = {"a": "sk-fake-****1111", "b": "sk-fake-****2222", "c": "sk-fake-****3333"}
 FAKE_TOKEN_MASK = "****babe"
@@ -80,11 +84,16 @@ def free_port():
     return port
 
 
-def accounts_block(name, base_url, env_file, var, models, extra=""):
-    """One `accounts:` list entry. The rotation order is the writing order."""
+def accounts_block(name, base_url, key_env, models, extra=""):
+    """One `accounts:` list entry. The rotation order is the writing order.
+
+    `key_env` is the NAME of an environment variable: the router reads its
+    credentials from its own environment and never from a file, so a test
+    injects synthetic values into the child env instead of writing key files.
+    """
     lines = ["  - name: %s" % name,
              "    base_url: %s" % base_url,
-             "    key: {env_file: %s, var: %s}" % (env_file, var)]
+             "    key: %s" % key_env]
     if extra:
         lines.append("    " + extra)
     lines.append("    models:")
@@ -93,7 +102,8 @@ def accounts_block(name, base_url, env_file, var, models, extra=""):
     return "\n".join(lines)
 
 
-def write_accounts(path, specs, token_env, defaults=None):
+def write_accounts(path, specs, token_env=TOKEN_ENV, defaults=None):
+    """`token_env` is the NAME of the inbound-token environment variable."""
     d = {"blacklist_exhausted": "2", "blacklist_failure": "2",
          "inject": "true"}
     d.update(defaults or {})
@@ -103,7 +113,7 @@ def write_accounts(path, specs, token_env, defaults=None):
   timeout: {connect: 5, read: 30}
   inject_stream_options: %(inject)s
 auth:
-  token: {env_file: %(token_env)s, var: FAKE_ROUTER_TOKEN}
+  token: %(token_env)s
   exempt_paths: [/health]
 accounts:
 %(accounts)s
@@ -206,7 +216,8 @@ class Client(object):
 
 
 class Fixture(object):
-    """temp dir + fake env files + N mock upstreams + a router subprocess."""
+    """temp dir + synthetic credentials in the child env + N mock upstreams +
+    a router subprocess."""
 
     def __init__(self, name="fx", accounts=None, defaults=None, n_mocks=3,
                  mock_defaults=None, log_level="INFO"):
@@ -233,19 +244,12 @@ class Fixture(object):
         self.tmp = tempfile.mkdtemp(prefix=self.name + "-", dir=TMP_ROOT)
         self.log_path = os.path.join(self.tmp, "router.log")
         self.seed.add(self.log_path)
-        envs = {}
-        for key, value in FAKE_KEYS.items():
-            p = os.path.join(self.tmp, "env-%s.env" % key)
-            with open(p, "w") as fh:
-                fh.write("FAKE_KEY_%s=%s\n" % (key.upper(), value))
-            os.chmod(p, 0o600)
-            envs[key] = p
-            self.seed.add(p)
-        token_env = os.path.join(self.tmp, "env-router.env")
-        with open(token_env, "w") as fh:
-            fh.write("FAKE_ROUTER_TOKEN=%s\n" % FAKE_TOKEN)
-        os.chmod(token_env, 0o600)
-        self.seed.add(token_env)
+        # the child's credential environment: accounts.yml names these variables
+        # and secrets.py reads them from os.environ (no file, no decryptor)
+        self.env_vars = dict((v, FAKE_KEYS[k]) for k, v in KEY_ENV.items())
+        self.env_vars[TOKEN_ENV] = FAKE_TOKEN
+        self.child_env = dict(os.environ)
+        self.child_env.update(self.env_vars)
 
         names = ["alpha", "beta", "gamma"][:self.n_mocks]
         specs = []
@@ -263,12 +267,11 @@ class Fixture(object):
                 models = {MODEL: "qwen/" + MODEL,
                           "claude-fable-5.1": "anthropic/claude-fable-5.1"}
             specs.append(accounts_block(names[i], m.base_url,
-                                        envs[letter], "FAKE_KEY_%s" % letter.upper(),
-                                        models))
+                                        KEY_ENV[letter], models))
         if self.accounts_override:
-            specs = self.accounts_override(specs, self.mocks, envs)
+            specs = self.accounts_override(specs, self.mocks, self.env_vars)
         self.accounts_path = write_accounts(os.path.join(self.tmp, "accounts.yml"),
-                                            specs, token_env, self.defaults)
+                                            specs, TOKEN_ENV, self.defaults)
         self.seed.add(self.accounts_path)
         self.port = free_port()
         cmd = [sys.executable, os.path.join(PKG, "router.py"),
@@ -279,7 +282,7 @@ class Fixture(object):
         self._log_fh = open(self.log_path, "ab")
         self.proc = subprocess.Popen(cmd, stdout=self._log_fh,
                                      stderr=subprocess.STDOUT,
-                                     stdin=subprocess.DEVNULL,
+                                     stdin=subprocess.DEVNULL, env=self.child_env,
                                      start_new_session=True, cwd=self.tmp)
         self.client = Client(self.port)
         self._wait_online()
@@ -322,7 +325,7 @@ class Fixture(object):
         self.stop_router()
         self.proc = subprocess.Popen(self.cmd, stdout=self._log_fh,
                                      stderr=subprocess.STDOUT,
-                                     stdin=subprocess.DEVNULL,
+                                     stdin=subprocess.DEVNULL, env=self.child_env,
                                      start_new_session=True, cwd=self.tmp)
         self.client = Client(self.port)
         self._wait_online()
@@ -865,11 +868,10 @@ class T16HotReload(RouterCase):
         self.addCleanup(extra.stop)
         with open(self.fx.accounts_path) as fh:
             text = fh.read()
-        env_file = os.path.join(self.fx.tmp, "env-a.env")
         # delta is appended LAST (definition order => it would be tried last for
         # any model it shares), so pickup is proven with a model name that only
         # delta maps: no order privilege is involved.
-        text += accounts_block("delta", extra.base_url, env_file, "FAKE_KEY_A",
+        text += accounts_block("delta", extra.base_url, KEY_ENV["a"],
                                {"delta-only": "delta-upstream"}) + "\n"
         with open(self.fx.accounts_path, "w") as fh:
             fh.write(text)
@@ -1162,26 +1164,23 @@ class T17ConfigValidation(unittest.TestCase):
         os.makedirs(TMP_ROOT, exist_ok=True)
         self.tmp = tempfile.mkdtemp(prefix="cfg-", dir=TMP_ROOT)
         self.addCleanup(shutil.rmtree, self.tmp, True)
-        self.env = os.path.join(self.tmp, "k.env")
-        with open(self.env, "w") as fh:
-            fh.write("K=%s\n" % FAKE_KEYS["a"])
-        self.token_env = os.path.join(self.tmp, "t.env")
-        with open(self.token_env, "w") as fh:
-            fh.write("FAKE_ROUTER_TOKEN=%s\n" % FAKE_TOKEN)
+        # parsing is credential-free: these are NAMES, and no value is needed
+        # anywhere in this test class (nothing is decrypted or even set)
+        self.key_env = KEY_ENV_NAME
+        self.token_env = TOKEN_ENV
 
     def _spec(self, **kw):
         name = kw.get("name", "one")
-        env_file = kw.get("env_file", self.env)
         return accounts_block(name,
                               kw.get("base_url", "https://example.invalid/v1"),
-                              env_file, "K",
+                              kw.get("key_env", self.key_env),
                               kw.get("models", {"m": "m"}),
                               extra=kw.get("extra", ""))
 
     def _load(self, specs, defaults=None):
         path = write_accounts(os.path.join(self.tmp, "a.yml"), specs,
                               self.token_env, defaults)
-        return config_mod.load(path, WS)
+        return config_mod.load(path)
 
     def test_valid_config_loads(self):
         cfg = self._load([self._spec()])
@@ -1240,9 +1239,28 @@ class T17ConfigValidation(unittest.TestCase):
             with self.assertRaises(config_mod.ConfigError):
                 self._load([self._spec()], defaults=defaults)
 
-    def test_missing_env_file_rejected(self):
-        with self.assertRaises(config_mod.ConfigError):
-            self._load([self._spec(env_file=os.path.join(self.tmp, "nope.env"))])
+    def test_a_credential_reference_must_be_an_env_var_name(self):
+        """The retired {env_file, var} mapping and anything that is not an
+        identifier (a pasted literal key) are both refused at load."""
+        for bad in ("{env_file: env/k.env, var: K}", FAKE_KEYS["a"], "", "K-V",
+                    "9K", "K V"):
+            path = os.path.join(self.tmp, "k.yml")
+            with open(path, "w") as fh:
+                fh.write("auth:\n  token: %s\n  exempt_paths: [/health]\n"
+                         "accounts:\n  - name: one\n"
+                         "    base_url: https://example.invalid/v1\n"
+                         "    key: %s\n    models:\n      m: m\n"
+                         % (self.token_env, bad))
+            with self.assertRaises(config_mod.ConfigError, msg=repr(bad)):
+                config_mod.load(path)
+
+    def test_an_unset_credential_is_not_a_load_error(self):
+        """Parsing never needs a secret in the environment: a name that is not
+        set still loads (the launcher's require_env gate and secrets.resolve are
+        what refuse it at runtime)."""
+        cfg = self._load([self._spec(key_env="NOT_SET_ANYWHERE")])
+        self.assertEqual("NOT_SET_ANYWHERE", cfg.accounts[0].key_env)
+        self.assertEqual(TOKEN_ENV, cfg.auth.token_env)
 
     def test_bad_base_url_rejected(self):
         with self.assertRaises(config_mod.ConfigError):
@@ -1260,19 +1278,19 @@ class T17ConfigValidation(unittest.TestCase):
         with self.assertRaises(config_mod.ConfigError):
             self._load([self._spec(name="")])
 
-    def test_missing_auth_token_file_rejected(self):
+    def test_auth_token_must_be_an_env_var_name(self):
         path = os.path.join(self.tmp, "b.yml")
         with open(path, "w") as fh:
-            fh.write("auth:\n  token: {env_file: %s, var: FAKE_ROUTER_TOKEN}\n"
-                     "accounts:\n%s\n"
-                     % (os.path.join(self.tmp, "absent.env"), self._spec()))
-        with self.assertRaises(config_mod.ConfigError):
-            config_mod.load(path, WS)
+            fh.write("auth:\n  token: {env_file: env/absent.env, var: %s}\n"
+                     "accounts:\n%s\n" % (TOKEN_ENV, self._spec()))
+        with self.assertRaises(config_mod.ConfigError) as cm:
+            config_mod.load(path)
+        self.assertIn("environment variable", str(cm.exception))
 
     def test_manager_refuses_a_bad_reload_and_keeps_the_old_config(self):
         path = write_accounts(os.path.join(self.tmp, "c.yml"), [self._spec()],
                               self.token_env)
-        mgr = config_mod.ConfigManager(path, WS)
+        mgr = config_mod.ConfigManager(path)
         self.assertEqual(1, len(mgr.get().accounts))
         time.sleep(0.01)
         with open(path, "w") as fh:
@@ -1291,7 +1309,7 @@ class T17ConfigValidation(unittest.TestCase):
         """A stale accounts.yml must not be able to change the rotation order."""
         path = write_accounts(os.path.join(self.tmp, "d.yml"), [self._spec()],
                               self.token_env)
-        mgr = config_mod.ConfigManager(path, WS)
+        mgr = config_mod.ConfigManager(path)
         self.assertEqual(["one"], [a.name for a in mgr.get().accounts])
         time.sleep(0.01)
         write_accounts(path, [self._spec(name="two"),
@@ -1354,17 +1372,11 @@ class T26EmptyStreamNoProgress(RouterCase):
 
 
 class TestSecretsUnit(unittest.TestCase):
-    def setUp(self):
-        os.makedirs(TMP_ROOT, exist_ok=True)
-        self.tmp = tempfile.mkdtemp(prefix="sec-", dir=TMP_ROOT)
-        self.addCleanup(shutil.rmtree, self.tmp, True)
-        self.s = secrets_mod.Secrets(WS)
+    """Credentials are environment variables: the resolver reads a mapping."""
 
-    def _env(self, name, value):
-        p = os.path.join(self.tmp, name)
-        with open(p, "w") as fh:
-            fh.write("V=%s\n" % value)
-        return p
+    def setUp(self):
+        self.env = {"V": FAKE_KEYS["a"]}
+        self.s = secrets_mod.Secrets(self.env)
 
     def test_mask_shapes(self):
         self.assertEqual("sk-sp-****wxyz", secrets_mod.mask("sk-sp-abcdefghijklmnopqrstuvwxyz"))
@@ -1372,34 +1384,37 @@ class TestSecretsUnit(unittest.TestCase):
         self.assertEqual("****babe", secrets_mod.mask(FAKE_TOKEN))
         self.assertEqual("(empty)", secrets_mod.mask(""))
 
-    def test_resolve_and_cache(self):
-        p = self._env("a.env", FAKE_KEYS["a"])
-        self.assertEqual(FAKE_KEYS["a"], self.s.resolve(p, "V"))
-        self.assertEqual(FAKE_KEYS["a"], self.s.resolve(p, "V"))     # cached
-        with open(p, "w") as fh:
-            fh.write("V=sk-fake-zzzz9999\n")
-        os.utime(p, (time.time() + 1, time.time() + 1))
-        self.assertEqual("sk-fake-zzzz9999", self.s.resolve(p, "V"))  # mtime busts it
+    def test_resolve_reads_the_environment(self):
+        self.assertEqual(FAKE_KEYS["a"], self.s.resolve("V"))
+        self.assertEqual(FAKE_KEYS["a"], self.s.resolve("V"))      # idempotent
+        self.env["V"] = "sk-fake-zzzz9999"      # no cache: the next read sees it
+        self.assertEqual("sk-fake-zzzz9999", self.s.resolve("V"))
 
-    def test_missing_var_and_file(self):
-        p = self._env("b.env", FAKE_KEYS["b"])
-        with self.assertRaises(secrets_mod.SecretError):
-            self.s.resolve(p, "NOPE")
-        with self.assertRaises(secrets_mod.SecretError):
-            self.s.resolve(os.path.join(self.tmp, "absent.env"), "V")
-        with self.assertRaises(secrets_mod.SecretError):
-            self.s.resolve(p, "")
+    def test_unset_empty_and_nameless_are_errors(self):
+        for env, name in (({"V": FAKE_KEYS["b"]}, "NOPE"),      # not set
+                          ({"V": ""}, "V"),                     # set but empty
+                          ({"V": FAKE_KEYS["b"]}, ""),          # no name given
+                          ({"V": FAKE_KEYS["b"]}, None)):
+            with self.assertRaises(secrets_mod.SecretError, msg=repr(name)):
+                secrets_mod.Secrets(env).resolve(name)
+
+    def test_check_name_shape(self):
+        for good in ("V", "_V1", "DASHSCOPE_TEAMPLAN1_API_KEY"):
+            self.assertTrue(secrets_mod.Secrets.check_name(good), good)
+        for bad in ("", None, "sk-fake-aaaa1111", "9V", "A B", "env/k.env"):
+            self.assertFalse(secrets_mod.Secrets.check_name(bad), repr(bad))
 
     def test_error_messages_are_secret_free(self):
-        p = self._env("c.env", FAKE_KEYS["c"])
+        s = secrets_mod.Secrets({"V": FAKE_KEYS["c"]})
         try:
-            self.s.resolve(p, "NOPE")
+            s.resolve("NOPE")
         except secrets_mod.SecretError as e:
             self.assertNotIn(FAKE_KEYS["c"], str(e))
+            self.assertIn("NOPE", str(e))       # names the variable, not a value
 
     def test_bearer_constant_time_compare(self):
-        p = self._env("t.env", FAKE_TOKEN)
-        self.s.set_token_source(p, "V")
+        self.s = secrets_mod.Secrets({"V": FAKE_TOKEN})
+        self.s.set_token_source("V")
         self.assertTrue(self.s.check_bearer("Bearer " + FAKE_TOKEN))
         self.assertTrue(self.s.check_bearer("bearer " + FAKE_TOKEN))
         self.assertFalse(self.s.check_bearer("Bearer " + FAKE_TOKEN[:-1]))
@@ -1411,11 +1426,16 @@ class TestSecretsUnit(unittest.TestCase):
 
     def test_bearer_without_a_source_fails_closed(self):
         with self.assertRaises(secrets_mod.SecretError):
-            secrets_mod.Secrets(WS).check_bearer("Bearer " + FAKE_TOKEN)
+            secrets_mod.Secrets({}).check_bearer("Bearer " + FAKE_TOKEN)
+
+    def test_bearer_with_an_unset_token_fails_closed(self):
+        s = secrets_mod.Secrets({})
+        s.set_token_source(TOKEN_ENV)
+        with self.assertRaises(secrets_mod.SecretError):
+            s.check_bearer("Bearer " + FAKE_TOKEN)
 
     def test_redact_known_and_generic_shapes(self):
-        p = self._env("d.env", FAKE_KEYS["a"])
-        self.s.resolve(p, "V")
+        self.s.resolve("V")
         self.assertEqual("key=sk-fake-****1111 here",
                          self.s.redact("key=%s here" % FAKE_KEYS["a"]))
         # unknown but key-shaped values are masked too (defence in depth)
@@ -1522,26 +1542,24 @@ class TestPoolUnit(unittest.TestCase):
         os.makedirs(TMP_ROOT, exist_ok=True)
         self.tmp = tempfile.mkdtemp(prefix="pool-", dir=TMP_ROOT)
         self.addCleanup(shutil.rmtree, self.tmp, True)
-        self.env = os.path.join(self.tmp, "k.env")
-        with open(self.env, "w") as fh:
-            fh.write("K=%s\n" % FAKE_KEYS["a"])
-        self.token_env = os.path.join(self.tmp, "t.env")
-        with open(self.token_env, "w") as fh:
-            fh.write("FAKE_ROUTER_TOKEN=%s\n" % FAKE_TOKEN)
+        self.key_env = KEY_ENV_NAME
+        self.token_env = TOKEN_ENV
+        # the pool reads credentials through Secrets, which reads this mapping
+        self.cred_env = {KEY_ENV_NAME: FAKE_KEYS["a"], TOKEN_ENV: FAKE_TOKEN}
         self.clock = {"t": 1_700_000_000.0}
-        self.secrets = secrets_mod.Secrets(WS)
+        self.secrets = secrets_mod.Secrets(self.cred_env)
 
     def _pool(self, n_accounts=1, exhausted=3600, failure=60, models=None,
               specs=None):
         if specs is None:
             specs = [accounts_block("acc%d" % i, "https://example.invalid/v1",
-                                    self.env, "K", models or {"m": "m"})
+                                    self.key_env, models or {"m": "m"})
                      for i in range(n_accounts)]
         path = write_accounts(os.path.join(self.tmp, "a.yml"), specs,
                               self.token_env,
                               {"blacklist_exhausted": str(exhausted),
                                "blacklist_failure": str(failure)})
-        cfgm = config_mod.ConfigManager(path, WS)
+        cfgm = config_mod.ConfigManager(path)
         return pool_mod.Pool(cfgm, self.secrets,
                              now_fn=lambda: self.clock["t"]), cfgm
 
@@ -1657,11 +1675,8 @@ class TestPoolUnit(unittest.TestCase):
 
     def test_a_resolvable_key_clears_a_key_error_blacklist(self):
         pool, cfgm = self._pool()
-        bad_env = os.path.join(self.tmp, "wrong-var.env")
-        with open(bad_env, "w") as fh:
-            fh.write("SOME_OTHER_VAR=x\n")          # file exists, var does not
         specs = [accounts_block("acc0", "https://example.invalid/v1",
-                                bad_env, "K", {"m": "m"})]
+                                "NOT_SET_ANYWHERE", {"m": "m"})]
         write_accounts(cfgm.get().path, specs, self.token_env)
         cfg2 = pool.cfgm.get()
         self.assertEqual("acc0", cfg2.accounts[0].name)
@@ -1670,8 +1685,9 @@ class TestPoolUnit(unittest.TestCase):
         st = pool.state_for("acc0")
         self.assertEqual(pool_mod.R_KEY_ERROR, st["blacklist_reason"])
         self.assertEqual([], pool.candidates("m")[0])
-        with open(bad_env, "w") as fh:              # the operator fixes the var
-            fh.write("K=%s\n" % FAKE_KEYS["b"])
+        # the operator fixes the environment (in a deployment that means a
+        # restart with the variable set; Secrets reads the mapping live)
+        self.cred_env["NOT_SET_ANYWHERE"] = FAKE_KEYS["b"]
         self.assertEqual(FAKE_KEYS["b"], pool.key_for(cfg2.accounts[0]))
         st = pool.state_for("acc0")
         self.assertEqual(pool_mod.OK, st["status"])   # cleared, no deadline wait
@@ -1700,10 +1716,10 @@ class TestPoolUnit(unittest.TestCase):
                          set(pool_mod.VIEW_REASON.values()))
 
     def test_models_view_marks_a_missing_mapping(self):
-        specs = [accounts_block("acc0", "https://example.invalid/v1", self.env,
-                                "K", {"m": "m"}),
-                 accounts_block("acc1", "https://example.invalid/v1", self.env,
-                                "K", {"other": "other"})]
+        specs = [accounts_block("acc0", "https://example.invalid/v1",
+                                self.key_env, {"m": "m"}),
+                 accounts_block("acc1", "https://example.invalid/v1",
+                                self.key_env, {"other": "other"})]
         pool, _cfgm = self._pool(specs=specs)
         data = dict((x["id"], x) for x in pool.models_view()["data"])
         self.assertEqual(["m", "other"], sorted(data))
@@ -1765,26 +1781,20 @@ class TestEndToEndSecrets(unittest.TestCase):
         self.assertNotIn("sk-", text)
         self.assertNotIn("=enc1:", text)        # no cipher value belongs here either
         for retired in ("priority:", "quota:", "credits_weights:",
-                        "preemptive_ratio", "state.json", "ledger"):
+                        "preemptive_ratio", "state.json", "ledger",
+                        "LLM_ROUTER_ENVDEC", "LLM_ROUTER_WS", "envdec"):
             self.assertNotIn(retired, text)
+        # the retired file-pointer form must not be *used* anywhere (the header
+        # prose may still name it while explaining what replaced it)
+        self.assertNotIn("key: {", text)
+        self.assertNotIn("token: {", text)
         self.assertNotIn("127.0.0.1", text)      # no mock endpoint left behind
         self.assertNotIn("localhost", text)
 
     def test_example_accounts_yml_loads_and_is_the_documented_shape(self):
-        """The example must load as shipped. config.load refuses a missing
-        env_file (by design), so the credential base is stubbed with exactly the
-        files the example references."""
-        os.makedirs(TMP_ROOT, exist_ok=True)
-        with open(self.EXAMPLE) as fh:
-            text = fh.read()
-        ws = tempfile.mkdtemp(prefix="example-ws-", dir=TMP_ROOT)
-        self.addCleanup(shutil.rmtree, ws, True)
-        for rel in sorted(set(re.findall(r"env_file:\s*([^,}\s]+)", text))):
-            path = os.path.join(ws, rel)
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            with open(path, "w") as fh:
-                fh.write("STUB=unused\n")
-        cfg = config_mod.load(self.EXAMPLE, ws)
+        """The example must load as shipped — and loading needs no credential
+        anywhere, because parsing only validates variable NAMES."""
+        cfg = config_mod.load(self.EXAMPLE)
         names = [a.name for a in cfg.ordered()]
         # pinned on purpose: accounts.example.yml IS the documented reference
         # shape, so editing the example must be reflected here in the same
@@ -1795,9 +1805,14 @@ class TestEndToEndSecrets(unittest.TestCase):
             self.assertTrue(acct.base_url.startswith("https://"), acct.base_url)
             self.assertNotIn("127.0.0.1", acct.base_url)
             self.assertNotIn("localhost", acct.base_url)
-            # every credential is a pointer, never a literal value
-            self.assertTrue(acct.key_env_file and acct.key_var)
-        self.assertEqual("env/router.env", cfg.auth.token_env_file)
+            # every credential is an environment-variable NAME, never a value
+            self.assertTrue(secrets_mod.Secrets.check_name(acct.key_env),
+                            acct.key_env)
+            self.assertNotIn("sk-", acct.key_env)
+        self.assertEqual(["ACME_API_KEY", "ACME_TEAM_API_KEY",
+                          "ACME_METERED_API_KEY"],
+                         [a.key_env for a in cfg.ordered()])
+        self.assertEqual("ROUTER_TOKEN", cfg.auth.token_env)
         self.assertEqual(["/health"], cfg.auth.exempt_paths)
         self.assertTrue(cfg.inject_stream_options)
         self.assertEqual(3600.0, cfg.blacklist_exhausted)
@@ -1821,9 +1836,9 @@ class T22RestartResetsBlacklist(RouterCase):
     fixture_kwargs = {"defaults": {"blacklist_exhausted": "3600"}}
 
     def test_a_second_pool_over_the_same_config_starts_clean(self):
-        cfgm = config_mod.ConfigManager(self.fx.accounts_path, WS)
+        cfgm = config_mod.ConfigManager(self.fx.accounts_path)
         clock = {"t": time.time()}
-        secrets = secrets_mod.Secrets(WS)
+        secrets = secrets_mod.Secrets(self.fx.env_vars)
         p1 = pool_mod.Pool(cfgm, secrets, now_fn=lambda: clock["t"])
         first = p1.candidates(MODEL)[0][0]
         self.assertEqual("alpha", first.name)
@@ -1869,9 +1884,9 @@ class T23ConcurrencyConsistency(RouterCase):
     """ThreadingHTTPServer serves concurrently: the pool lock must hold."""
 
     def test_concurrent_pool_access_keeps_exactly_one_status_per_account(self):
-        cfgm = config_mod.ConfigManager(self.fx.accounts_path, WS)
+        cfgm = config_mod.ConfigManager(self.fx.accounts_path)
         clock = {"t": time.time()}
-        p = pool_mod.Pool(cfgm, secrets_mod.Secrets(WS),
+        p = pool_mod.Pool(cfgm, secrets_mod.Secrets(self.fx.env_vars),
                           now_fn=lambda: clock["t"])
         names = ["alpha", "beta", "gamma"]
         errors = []
@@ -1966,20 +1981,14 @@ class T24ResidualKeysRejected(RouterCase):
     def test_each_retired_key_is_a_config_error(self):
         tmp = tempfile.mkdtemp(prefix="retired-", dir=TMP_ROOT)
         self.addCleanup(shutil.rmtree, tmp, True)
-        env = os.path.join(tmp, "k.env")
-        with open(env, "w") as fh:
-            fh.write("K=%s\n" % FAKE_KEYS["a"])
-        token_env = os.path.join(tmp, "t.env")
-        with open(token_env, "w") as fh:
-            fh.write("FAKE_ROUTER_TOKEN=%s\n" % FAKE_TOKEN)
         self.assertEqual(("priority", "quota", "credits_weights"),
                          config_mod.REJECTED_ACCOUNT_KEYS)
         for retired in self.RETIRED:
-            specs = [accounts_block("acc0", "https://example.invalid/v1", env,
-                                    "K", {"m": "m"}, extra=retired)]
-            path = write_accounts(os.path.join(tmp, "a.yml"), specs, token_env)
+            specs = [accounts_block("acc0", "https://example.invalid/v1",
+                                    KEY_ENV_NAME, {"m": "m"}, extra=retired)]
+            path = write_accounts(os.path.join(tmp, "a.yml"), specs, TOKEN_ENV)
             with self.assertRaises(config_mod.ConfigError) as cm:
-                config_mod.load(path, WS)
+                config_mod.load(path)
             self.assertIn("retired key", str(cm.exception), retired)
 
     def test_a_hot_reload_carrying_a_retired_key_is_refused(self):

@@ -9,9 +9,14 @@ in-memory — nothing is persisted, debug detail goes to the log only.
 
   python3 router.py --host 127.0.0.1 --port 9200 --accounts accounts.yml
 
-Paths are resolved from this file's own location and from LLM_ROUTER_WS (the
-credential base, default: this repo's parent directory), never from the cwd, so
-a service manager needs no `cwd` setting.
+The accounts path is resolved from this file's own location (never from the
+cwd), so a service manager needs no `cwd` setting.
+
+Credentials are **environment variables, referenced by name** from accounts.yml
+(`key: ACME_API_KEY`, `auth: {token: ROUTER_TOKEN}`): this program reads them
+from its own environment and never learns how a deployment stores or decrypts
+them. Inject them at spawn (a service manager's env hook, a wrapper, a secret
+store agent) and gate the start on their presence there.
 
 Python 3.8 syntax floor; stdlib + PyYAML only.
 """
@@ -23,11 +28,6 @@ import sys
 import threading
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-# Credential base: relative `env_file:` paths in accounts.yml resolve against it
-# and the decryptor is looked up as <WS>/encrypt/envdec.py (override with
-# LLM_ROUTER_ENVDEC). Default = this repo's parent directory, which is the
-# in-workspace layout <ws>/llm-router/; a standalone checkout sets LLM_ROUTER_WS.
-WS = os.environ.get("LLM_ROUTER_WS") or os.path.dirname(HERE)
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
@@ -83,8 +83,6 @@ def parse_args(argv=None):
                         "default $LLM_ROUTER_ACCOUNTS or <repo>/accounts.yml)")
     p.add_argument("--log-level", default="INFO",
                    choices=("DEBUG", "INFO", "WARNING", "ERROR"))
-    p.add_argument("--secret-ttl", type=float, default=secrets_mod.DEFAULT_TTL,
-                   help="seconds a decrypted credential is cached (default %(default)s)")
     return p.parse_args(argv)
 
 
@@ -92,12 +90,12 @@ def warm_credentials(pool, cfg, secrets, logger):
     """Resolve every credential once at startup: fail loudly, log masked only."""
     try:
         hint = secrets.token_hint()
-        logger.info("AUTH inbound bearer token loaded from %s (var %s, hint %s)",
-                    cfg.auth.token_env_file, cfg.auth.token_var, hint)
+        logger.info("AUTH inbound bearer token loaded from env %s (hint %s)",
+                    cfg.auth.token_env, hint)
     except Exception as e:
         logger.error("AUTH_UNAVAILABLE cannot load the inbound router token from "
-                     "%s: %s — every authenticated endpoint will answer 500 "
-                     "until this is fixed", cfg.auth.token_env_file,
+                     "env %s: %s — every authenticated endpoint will answer 500 "
+                     "until this is fixed", cfg.auth.token_env,
                      secrets.redact(str(e)))
     for acct in cfg.accounts:
         try:
@@ -106,18 +104,18 @@ def warm_credentials(pool, cfg, secrets, logger):
                         acct.name, acct.order, acct.base_url, secrets.mask(key),
                         len(acct.models))
         except Exception as e:
-            logger.warning("KEY_ERROR account=%s env_file=%s var=%s: %s (the other "
-                           "accounts still serve)", acct.name, acct.key_env_file,
-                           acct.key_var, secrets.redact(str(e)))
+            logger.warning("KEY_ERROR account=%s env=%s: %s (the other accounts "
+                           "still serve)", acct.name, acct.key_env,
+                           secrets.redact(str(e)))
 
 
 def main(argv=None):
     args = parse_args(argv)
-    secrets = secrets_mod.Secrets(WS, ttl=args.secret_ttl)
+    secrets = secrets_mod.Secrets()
     logger = build_logger(secrets, getattr(logging, args.log_level))
-    cfgm = config_mod.ConfigManager(args.accounts, WS, logger=logger)
+    cfgm = config_mod.ConfigManager(args.accounts, logger=logger)
     cfg = cfgm.get()
-    secrets.set_token_source(cfg.auth.token_env_file, cfg.auth.token_var)
+    secrets.set_token_source(cfg.auth.token_env)
 
     pool = pool_mod.Pool(cfgm, secrets, logger=logger)
     warm_credentials(pool, cfg, secrets, logger)

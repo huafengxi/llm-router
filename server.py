@@ -2,9 +2,9 @@
 
 Auth: every endpoint EXCEPT the ones listed in
 `accounts.yml -> auth.exempt_paths` (default: /health) requires
-`Authorization: Bearer <token>`, where the token is the (possibly encrypted)
-value named by `auth.token: {env_file, var}` and resolved through secrets.py,
-compared with hmac.compare_digest.  A missing/mismatched credential yields 401
+`Authorization: Bearer <token>`, where the token is the value of the environment
+variable named by `auth.token` and resolved through secrets.py, compared with
+hmac.compare_digest.  A missing/mismatched credential yields 401
 whose body never echoes the expected or the supplied value.  /health stays
 unauthenticated because a liveness probe sends no credential — its payload
 therefore carries liveness and a pool summary only (no key, no token, no account

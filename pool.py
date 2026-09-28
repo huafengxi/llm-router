@@ -179,19 +179,22 @@ class Pool(object):
     def key_for(self, acct):
         """Plaintext upstream key (memory only); blacklists on failure."""
         try:
-            value = self.secrets.resolve(acct.key_env_file, acct.key_var)
+            value = self.secrets.resolve(acct.key_env)
         except Exception as e:
             detail = self.secrets.redact(str(e))
             self.mark_failure(acct, R_KEY_ERROR, detail=detail)
-            self._log("error", "KEY_ERROR account=%s env_file=%s var=%s: %s",
-                      acct.name, acct.key_env_file, acct.key_var, detail)
+            self._log("error", "KEY_ERROR account=%s env=%s: %s",
+                      acct.name, acct.key_env, detail)
             raise AccountKeyError(str(e))
         with self._lock:
             st = self._st(acct.name)
             st["key_hint"] = self.secrets.mask(value)
             if st.get("status") == BLACKLISTED and \
                     st.get("blacklist_reason") == R_KEY_ERROR:
-                # the env file was fixed: a resolvable key clears that blacklist
+                # a resolvable key clears that blacklist. The environment is
+                # normally fixed for the process lifetime, so in practice an
+                # unresolvable name is a restart-fix (the launcher's require_env
+                # gate is what should have refused the start).
                 st["status"] = OK
                 st["blacklist_reason"] = None
                 st["blacklist_until"] = None

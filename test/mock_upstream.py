@@ -26,6 +26,10 @@ Behaviour is scripted per request (a queue of specs, then a default):
     abrupt: bool          with break_after: close without the terminating chunk
                           (the router sees an IncompleteRead mid-stream)
     quota_text: str       the error message used by break_after / kind "error"
+    raw_body: str|bytes   kind "error": send this body VERBATIM instead of the
+                          {"error": {…}} envelope (real gateways are not uniform:
+                          a subscription-plan 404 arrives as a flat object, and
+                          the classification under test reads that exact text)
 
 Every request is recorded (method, path, model, stream flag, whether
 stream_options was present, the LAST FOUR characters of the Authorization value
@@ -52,7 +56,8 @@ def spec(**kw):
             "stream": None, "chunks": 2, "usage": dict(OK_USAGE),
             "usage_chunk": None, "reject_stream_options": False, "delay": 0.0,
             "break_after": None, "abrupt": False, "quota_text": DEFAULT_QUOTA_TEXT,
-            "content": "pong", "empty_stream": False, "no_finish": False}
+            "content": "pong", "empty_stream": False, "no_finish": False,
+            "raw_body": None}
     base.update(kw)
     return base
 
@@ -70,6 +75,11 @@ def exhausted_spec(status=429, message=None, **kw):
 def throttle_spec(status=429, message=None, **kw):
     kw.setdefault("code", "Throttling.RateQuota")         # real aliyun shape
     return error_spec(status, message or DEFAULT_THROTTLE_TEXT, **kw)
+
+
+def raw_error_spec(status, raw_body, **kw):
+    """An error whose body goes out VERBATIM (no `{"error": …}` envelope)."""
+    return spec(kind="error", status=status, message="", raw_body=raw_body, **kw)
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -134,12 +144,16 @@ class _Handler(BaseHTTPRequestHandler):
             return dict(mock.default)
 
     def _send_error(self, s):
-        payload = {"error": {"message": s.get("message") or "mock error",
-                             "type": "mock_error", "param": None,
-                             "code": s.get("code")}}
-        if s.get("status") == 429 and not s.get("code"):
-            payload["error"]["code"] = "Throttling.RateQuota"
-        body = json.dumps(payload).encode("utf-8")
+        raw = s.get("raw_body")
+        if raw is None:
+            payload = {"error": {"message": s.get("message") or "mock error",
+                                 "type": "mock_error", "param": None,
+                                 "code": s.get("code")}}
+            if s.get("status") == 429 and not s.get("code"):
+                payload["error"]["code"] = "Throttling.RateQuota"
+            body = json.dumps(payload).encode("utf-8")
+        else:
+            body = raw if isinstance(raw, bytes) else raw.encode("utf-8")
         self.send_response(s.get("status", 400))
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))

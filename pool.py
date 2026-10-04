@@ -6,14 +6,17 @@ and a blacklist has exactly two durations:
 
   blacklist_exhausted  quota/arrears class (classify -> exhausted)
   blacklist_failure    everything else that is the account's fault: rate limit,
-                       5xx, unknown status, network error, unresolvable key and
-                       an upstream 401 (refused credential)
+                       5xx, unknown status, network error, unresolvable key, an
+                       upstream 401 (refused credential) and an upstream 404 for
+                       a pool model the account maps (it cannot serve what it
+                       claims to serve)
 
 Availability rules:
   blacklisted -> skipped until `blacklist_until`, with `blacklist_reason` saying
                  why (exhausted / throttled / server_error / key_error /
                  upstream_key_rejected)
-  a plain client-side 4xx (400/404/405/413/415/422) is NOT the account's fault:
+  a plain client-side 4xx (400/405/413/415/422, and a 404 for a request that
+                 named no model this account maps) is NOT the account's fault:
                  it never blacklists and never switches — server.py returns it
                  to the client unchanged
 

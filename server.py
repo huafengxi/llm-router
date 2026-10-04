@@ -453,7 +453,13 @@ class RouterHandler(BaseHTTPRequestHandler):
                                     "once (the REQ ok line reports "
                                     "usage_source=missing)", acct.name)
                 continue
-            category, evidence = classify.classify(status, err_text)
+            # `up_model` is this account's own mapping of the requested pool
+            # model: when it exists, an upstream 404 means the account cannot
+            # serve a model it claims to serve (account-side fault -> switch),
+            # while a 404 for a request that named no model stays a path-level
+            # client error (see classify.classify).
+            category, evidence = classify.classify(
+                status, err_text, mapped_model=up_model is not None)
             redacted = app.secrets.redact(err_text)[:200]
             if category == classify.EXHAUSTED:
                 app.pool.mark_exhausted(acct, detail="%s %s" % (evidence, redacted),

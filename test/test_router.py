@@ -24,7 +24,9 @@ injection, T20 injection 400 fallback, T21 generic passthrough,
 T22 restart resets blacklists, T23 concurrency consistency, T24 retired keys
 rejected, T25 upstream 401 rejected, T26 empty stream with no finish_reason
 (200 + SSE frames that carry neither content nor a finish_reason => switch
-accounts while nothing has been written).
+accounts while nothing has been written), T27 upstream 404 split by routing
+context (a 404 for a pool model the account maps => switch + short blacklist;
+a path-level 404 and the router's own no-mapping answer => unchanged).
 """
 import http.client
 import json
@@ -1151,6 +1153,39 @@ class T05ClassifyTable(unittest.TestCase):
         self.assertEqual(classify.SERVER_ERROR,
                          classify.classify_exception(ConnectionResetError("reset"))[0])
 
+    def test_a_404_splits_by_routing_context_not_by_wording(self):
+        # a real gateway's subscription-plan 404: a FLAT object (no {"error": …}
+        # envelope) carrying neither quota nor rate-limit wording, so no phrase
+        # tier can ever decide it — only the caller's routing context can
+        plan_404 = ('{"code":"404","type":"model_not_available","message":"The '
+                    'requested model is not included in your subscription plan."}')
+        got, why = classify.classify(404, plan_404, mapped_model=True)
+        self.assertEqual(classify.SERVER_ERROR, got)
+        self.assertIn("mapped_model=True", why)
+        # the same body without that context (a path-level / model-less request)
+        # stays a client error, and the default is the safe one
+        self.assertEqual(classify.CLIENT_ERROR, classify.classify(404, plan_404)[0])
+        self.assertEqual(classify.CLIENT_ERROR,
+                         classify.classify(404, plan_404, mapped_model=False)[0])
+        self.assertIn(404, classify.CLIENT_ERROR_STATUS)   # the unmapped tier
+        # wording still outranks the split: quota semantics on a 404 stay long-tier
+        self.assertEqual(classify.EXHAUSTED, classify.classify(
+            404, '{"message":"Allocated quota exceeded"}', mapped_model=True)[0])
+        # the context flag is 404-only: every other class ignores it
+        for status, want in ((400, classify.CLIENT_ERROR),
+                             (401, classify.CLIENT_ERROR),
+                             (403, classify.CLIENT_ERROR),
+                             (405, classify.CLIENT_ERROR),
+                             (413, classify.CLIENT_ERROR),
+                             (415, classify.CLIENT_ERROR),
+                             (422, classify.CLIENT_ERROR),
+                             (418, classify.UNKNOWN),
+                             (500, classify.SERVER_ERROR),
+                             (503, classify.SERVER_ERROR)):
+            self.assertEqual(want,
+                             classify.classify(status, "x", mapped_model=True)[0],
+                             "status=%d must ignore mapped_model" % status)
+
     def test_quota_semantics_helper(self):
         self.assertTrue(classify.has_quota_semantics("Allocated quota exceeded"))
         self.assertTrue(classify.has_quota_semantics("余额不足"))
@@ -2084,6 +2119,186 @@ class T25UpstreamKeyRejected(RouterCase):
         self.assertEqual(3, len(self.fx.grep_log("UPSTREAM_KEY_REJECTED")))
         self.assertEqual(0, self.fx.pool_view()["accounts_available"])
         self.assertEqual("all_exhausted", self.fx.pool_view()["pool"])
+
+class T27Upstream404(RouterCase):
+    """An upstream 404 is split by ROUTING CONTEXT, never by body wording.
+
+    Real-world fault (2026-10-04, ~1h pool-wide): the gateway behind the order-1
+    account changed its subscription plan and answered 404
+    `{"type":"model_not_available"}` for a pool model that account DID map.  404
+    was a member of the client-error family, so the body went back to the client
+    unchanged: no switch, no blacklist => every request for that pool name died
+    on the same account while the other seven were never tried, and the callers
+    retried into a self-sustaining failure storm.
+
+    The router only offers a request to an account whose `models:` covers the
+    pool name, so a 404 from that upstream means the account cannot serve what
+    it claims to serve => account-side fault => the short blacklist + a switch,
+    exactly like a 5xx.  What must NOT change: a 404 for a request that named no
+    model (the upstream does not serve that path — trying another account would
+    repeat it) and the router's own answers, which never reach classify at all.
+    """
+
+    fixture_kwargs = {"defaults": {"blacklist_failure": "60",
+                                   "blacklist_exhausted": "3600"}}
+    # verbatim gateway shape: flat object, no {"error": …} envelope, and no
+    # quota / rate-limit wording anywhere => no phrase tier can decide it
+    PLAN_404 = json.dumps({
+        "code": "404",
+        "type": "model_not_available",
+        "message": ("The requested model is not included in your subscription "
+                    "plan. Please create a Pay-As-You-Go API Key to access this "
+                    "model, or check available models for your plan at "
+                    "https://gateway.example/docs/guide/subscription.html "
+                    "(request_id: 00000000000000000000000000000000)"),
+    })
+
+    def test_a_404_on_a_mapped_model_switches_and_blacklists(self):
+        a, b, _c = self.mocks
+        a.script(mock.raw_error_spec(404, self.PLAN_404))
+        r = self.client.chat()
+        self.assertEqual(200, r.status, r.text())       # served by the next seat
+        self.assertEqual(1, a.count)
+        self.assertEqual(1, b.count)                    # switched in-request
+        self.assertIn("account=beta", self.fx.grep_log("REQ ok account=")[-1])
+        self.assertNotIn("model_not_available", r.text())   # never relayed
+        self.assertNotEqual(404, r.status)
+        line = self.fx.grep_log("UPSTREAM_ERROR")[0]
+        self.assertIn("account=alpha", line)
+        self.assertIn("status=404", line)
+        self.assertIn("mapped_model=True", line)
+        self.assertIn("-> next account", line)
+        self.assertIn("blacklisted 60s", line)          # the SHORT tier
+        bl = self.fx.grep_log("ACCOUNT_BLACKLISTED")[0]
+        self.assertIn("account=alpha", bl)
+        self.assertIn("reason=server_error", bl)
+        self.assertIn("blacklist_s=60", bl)
+        view = self.fx.acct_view("alpha")
+        self.assertFalse(view["available"])
+        self.assertEqual("throttled", view["reason"])   # folded transient class
+        self.assertIsNotNone(view["until"])
+        # the two paths that must NOT fire on this class
+        self.assertFalse(self.fx.grep_log("CLIENT_ERROR", timeout=0.3))
+        self.assertFalse(self.fx.grep_log("ACCOUNT_EXHAUSTED", timeout=0.3))
+
+    def test_a_streamed_404_on_a_mapped_model_switches_before_any_byte(self):
+        a, b, _c = self.mocks
+        a.script(mock.raw_error_spec(404, self.PLAN_404))
+        r = self.client.stream_chat()
+        self.assertEqual(200, r.status, r.text()[:400])
+        self.assertIn("[DONE]", r.text())
+        self.assertIn("part0", r.text())
+        self.assertEqual(1, a.count)
+        self.assertEqual(1, b.count)
+        self.assertEqual("throttled", self.fx.acct_view("alpha")["reason"])
+        self.assertIn("account=beta", self.fx.grep_log("REQ ok account=")[-1])
+        self.assertFalse(self.fx.grep_log("CLIENT_ERROR", timeout=0.3))
+
+    def test_the_blacklisted_seat_is_skipped_by_the_next_request(self):
+        a, _b, _c = self.mocks
+        a.script(mock.raw_error_spec(404, self.PLAN_404))
+        self.assertEqual(200, self.client.chat().status)
+        self.assertEqual(1, a.count)
+        # the blacklist outlives the request that earned it: the next one is not
+        # offered to that seat either (recovery stays lazy, T03)
+        self.assertEqual(200, self.client.chat().status)
+        self.assertEqual(1, a.count)
+        view = self.fx.acct_view("alpha")
+        self.assertFalse(view["available"])
+        self.assertEqual("throttled", view["reason"])   # folded transient class
+        self.assertIsNotNone(view["until"])
+        self.assertEqual({"alpha": "throttled"},
+                         dict((x["name"], x["reason"])
+                              for x in self.fx.model_entry()["accounts"]
+                              if not x["available"]))
+
+    def test_the_whole_pool_answering_404_yields_503_not_a_404(self):
+        for m in self.mocks:
+            m.script(mock.raw_error_spec(404, self.PLAN_404))
+        r = self.client.chat()
+        self.assertEqual(503, r.status)
+        body = r.json()
+        self.assertEqual("all_accounts_failed", body["error"]["type"])
+        self.assertEqual(["server_error"] * 3,
+                         [x["reason"] for x in body["error"]["accounts"]])
+        self.assertNotIn("model_not_available", r.text())
+        self.assertEqual(3, len(self.fx.grep_log("UPSTREAM_ERROR")))
+        self.assertEqual(0, self.fx.pool_view()["accounts_available"])
+        self.assertTrue(self.fx.grep_log("POOL_EXHAUSTED"))
+
+    def test_a_path_level_404_is_still_returned_to_the_client_unchanged(self):
+        """No model in the request => the 404 is about the request's own shape."""
+        a, b, _c = self.mocks
+        not_found = '{"code":"404","message":"Not Found"}'
+        a.script(mock.raw_error_spec(404, not_found))
+        r = self.client.get("/v1/embeddings")           # the upstream has no such path
+        self.assertEqual(404, r.status)
+        self.assertIn("Not Found", r.text())            # relayed verbatim
+        self.assertEqual(1, a.count)
+        self.assertEqual(0, b.count)                    # no pointless switch
+        line = self.fx.grep_log("CLIENT_ERROR")[0]
+        self.assertIn("account=alpha", line)
+        self.assertIn("status=404", line)
+        self.assertIn("no account switch, no blacklist", line)
+        view = self.fx.acct_view("alpha")
+        self.assertTrue(view["available"])
+        self.assertEqual("ok", view["reason"])
+        self.assertFalse(self.fx.grep_log("ACCOUNT_BLACKLISTED", timeout=0.3))
+        self.assertFalse(self.fx.grep_log("UPSTREAM_ERROR", timeout=0.3))
+
+    def test_a_model_less_body_keeps_its_404_on_the_client_side(self):
+        a, b, _c = self.mocks
+        a.script(mock.raw_error_spec(404, '{"code":"404","message":"Not Found"}'))
+        r = self.client.post(CHAT, {"messages": [{"role": "user", "content": "hi"}]})
+        self.assertEqual(404, r.status)
+        self.assertEqual(1, a.count)
+        self.assertEqual(0, b.count)
+        self.assertTrue(self.fx.acct_view("alpha")["available"])
+        self.assertFalse(self.fx.grep_log("ACCOUNT_BLACKLISTED", timeout=0.3))
+
+    def test_the_routers_own_answers_never_enter_the_account_fault_path(self):
+        """No seat maps the pool name / unknown path => client-facing, no blacklist.
+
+        The router's own "no account maps this model" answer is a 503
+        `no_account_for_model` (its unknown-path answer is a 404); neither is
+        produced by an upstream, so neither may touch the pool state.
+        """
+        r = self.client.chat(model="no-such-model")
+        self.assertEqual(503, r.status)
+        self.assertEqual("no_account_for_model", r.json()["error"]["type"])
+        self.assertEqual(["no_mapping"] * 3,
+                         [x["reason"] for x in r.json()["error"]["accounts"]])
+        self.assertEqual(0, sum(m.count for m in self.mocks))   # nothing went upstream
+        self.assertFalse(self.fx.grep_log("ACCOUNT_BLACKLISTED", timeout=0.3))
+        self.assertFalse(self.fx.grep_log("CLIENT_ERROR", timeout=0.3))
+        self.assertFalse(self.fx.grep_log("UPSTREAM_ERROR", timeout=0.3))
+        self.assertEqual(3, self.fx.pool_view()["accounts_available"])
+        r2 = self.client.get("/nope")
+        self.assertEqual(404, r2.status)
+        self.assertEqual(0, sum(m.count for m in self.mocks))
+        self.assertFalse(self.fx.grep_log("ACCOUNT_BLACKLISTED", timeout=0.3))
+        self.assertEqual(3, self.fx.pool_view()["accounts_available"])
+
+    def test_the_other_client_error_statuses_are_unchanged_on_a_mapped_model(self):
+        a, b, _c = self.mocks
+        for status in (400, 405, 413, 415, 422):
+            a.script(mock.error_spec(status, "client-side %d" % status))
+            r = self.client.chat()
+            self.assertEqual(status, r.status)
+            self.assertIn("client-side %d" % status, r.text())
+            self.assertEqual(0, b.count)                # still no switch
+            line = self.fx.grep_log("CLIENT_ERROR")[-1]
+            self.assertIn("status=%d" % status, line)
+            self.assertIn("no account switch, no blacklist", line)
+        self.assertEqual(5, a.count)
+        self.assertEqual(0, b.count)
+        view = self.fx.acct_view("alpha")
+        self.assertTrue(view["available"])
+        self.assertEqual("ok", view["reason"])
+        self.assertFalse(self.fx.grep_log("ACCOUNT_BLACKLISTED", timeout=0.3))
+        self.assertFalse(self.fx.grep_log("UPSTREAM_ERROR", timeout=0.3))
+        self.assertEqual([], self.fx.stray_files())
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

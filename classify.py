@@ -9,12 +9,25 @@ Categories (the caller, server.py, turns them into a blacklist duration and a
 switch decision; this module only classifies):
   exhausted     account quota is spent -> the long blacklist, switch account
   throttled     rate limit -> the short blacklist, switch account
-  server_error  5xx / network / timeout -> the short blacklist, switch account
+  server_error  5xx / network / timeout, and an upstream 404 for a pool model
+                this account maps -> the short blacklist, switch account
   client_error  4xx parameter & auth errors -> the caller decides: a 401 (the
                 upstream refused our key) is the account's fault and gets the
                 short blacklist + a switch, every other 4xx is returned to the
-                client unchanged and never blacklists
+                client unchanged and never blacklists.  A 404 lands here only
+                when the caller did NOT map a pool model for this account, i.e.
+                the request named a path (or no model at all) that the upstream
+                does not serve — that is the request's own shape, so trying
+                another account would repeat it
   unknown       anything else -> treated like server_error
+
+A 404 is split by ROUTING CONTEXT, not by body wording: the router only offers a
+request to an account whose `models:` covers the pool name, so a 404 from that
+upstream means the account cannot serve a model it claims to serve (its mapping
+drifted, or its plan changed) — an account-side fault.  Matching the upstream's
+phrasing instead would leave every wording it has not yet invented classified as
+the client's fault, which pins the whole pool to the one account that answers
+404 (no switch, no blacklist, every request lost).
 
 Python 3.8 syntax floor; stdlib only.
 """
@@ -128,8 +141,13 @@ def _has(text, phrases):
     return None
 
 
-def classify(status, body):
+def classify(status, body, mapped_model=False):
     """-> (category, evidence).  `evidence` is a short, log-safe string.
+
+    `mapped_model` is routing context from the caller: True when this account's
+    `models:` mapping covers the pool model of the request (the account claimed
+    to serve it), False when the request named no model / the account maps none.
+    It only matters for status 404.
 
     Precedence (the status code alone never decides):
       1 explicit quota-exhaustion wording            -> exhausted
@@ -137,7 +155,9 @@ def classify(status, body):
       3 status 402/429/403 + a quota token           -> exhausted
       4 weak rate-limit hint                         -> throttled
       5 bare 429                                     -> throttled
-      6 5xx / 4xx / anything else
+      6 5xx                                          -> server_error
+      7 404 + mapped_model                           -> server_error
+      8 other 4xx / anything else
     """
     low = _low(body)
     hit = _has(low, EXHAUSTED_PHRASES)
@@ -161,6 +181,9 @@ def classify(status, body):
         return THROTTLED, "status=429 (no quota semantics)"
     if code >= 500:
         return SERVER_ERROR, "status=%d" % code
+    if code == 404 and mapped_model:
+        return SERVER_ERROR, ("mapped_model=True (this account maps the pool "
+                              "model, so the upstream 404 is its own fault)")
     if code in CLIENT_ERROR_STATUS:
         return CLIENT_ERROR, "status=%d" % code
     if code:

@@ -1171,7 +1171,8 @@ class T05ClassifyTable(unittest.TestCase):
         # wording still outranks the split: quota semantics on a 404 stay long-tier
         self.assertEqual(classify.EXHAUSTED, classify.classify(
             404, '{"message":"Allocated quota exceeded"}', mapped_model=True)[0])
-        # the context flag is 404-only: every other class ignores it
+        # the context flag serves exactly two rules (this 404 and the
+        # entitlement denial below); with a neutral body every class ignores it
         for status, want in ((400, classify.CLIENT_ERROR),
                              (401, classify.CLIENT_ERROR),
                              (403, classify.CLIENT_ERROR),
@@ -1185,6 +1186,39 @@ class T05ClassifyTable(unittest.TestCase):
             self.assertEqual(want,
                              classify.classify(status, "x", mapped_model=True)[0],
                              "status=%d must ignore mapped_model" % status)
+
+    def test_an_entitlement_denial_splits_by_routing_context_too(self):
+        # the verbatim body of a real plan-lapse 403: entitlement wording, no
+        # quota token and no rate-limit wording anywhere, so only the caller's
+        # routing context can decide it
+        denied = ('{"message":"Access to model denied. Please make sure you are '
+                  'eligible for using the model.","type":"AccessDenied.Unpurchased",'
+                  '"code":"AccessDenied.Unpurchased"}')
+        got, why = classify.classify(403, denied, mapped_model=True)
+        self.assertEqual(classify.EXHAUSTED, got)
+        self.assertIn("mapped_model=True", why)
+        self.assertIn("phrase='unpurchased'", why)
+        # without that context it is about the request, and the default is safe
+        self.assertEqual(classify.CLIENT_ERROR, classify.classify(403, denied)[0])
+        self.assertEqual(classify.CLIENT_ERROR,
+                         classify.classify(403, denied, mapped_model=False)[0])
+        # a 401 stays the credential class even with entitlement wording
+        self.assertEqual(classify.CLIENT_ERROR,
+                         classify.classify(401, denied, mapped_model=True)[0])
+        # the rule needs the wording: a bare 403 on a mapped model is unchanged
+        self.assertEqual(classify.CLIENT_ERROR, classify.classify(
+            403, '{"code":"403","message":"forbidden"}', mapped_model=True)[0])
+        # the earlier tiers keep their precedence over it
+        self.assertEqual(classify.EXHAUSTED, classify.classify(
+            403, '{"message":"Unpurchased: 额度不足"}', mapped_model=True)[0])
+        self.assertEqual(classify.THROTTLED, classify.classify(
+            403, '{"message":"Requests rate limit exceeded (unpurchased)"}',
+            mapped_model=True)[0])
+        self.assertEqual(classify.SERVER_ERROR, classify.classify(
+            503, '{"message":"AccessDenied.Unpurchased"}', mapped_model=True)[0])
+        # the same family in the upstream's own language
+        self.assertEqual(classify.EXHAUSTED, classify.classify(
+            403, '{"message":"您没有使用该模型的权限"}', mapped_model=True)[0])
 
     def test_quota_semantics_helper(self):
         self.assertTrue(classify.has_quota_semantics("Allocated quota exceeded"))
@@ -2297,6 +2331,153 @@ class T27Upstream404(RouterCase):
         self.assertEqual("ok", view["reason"])
         self.assertFalse(self.fx.grep_log("ACCOUNT_BLACKLISTED", timeout=0.3))
         self.assertFalse(self.fx.grep_log("UPSTREAM_ERROR", timeout=0.3))
+        self.assertEqual([], self.fx.stray_files())
+
+
+class T28Upstream403Entitlement(RouterCase):
+    """An upstream denial of entitlement to a MAPPED model is the seat's fault.
+
+    Real-world fault (2026-10-08, ~10h pool-wide for one role name): a seat
+    whose monthly plan had been spent answered 429 `insufficient_quota` all
+    evening (correctly booked as exhaustion: long blacklist + switch), and from
+    the plan's reset instant onwards answered the same requests with
+    403 `AccessDenied.Unpurchased` — "Access to model denied. Please make sure
+    you are eligible for using the model."  That body carries no quota token and
+    no rate-limit wording, so it fell through to the client-error family and went
+    back to the client unchanged: no switch, no blacklist => every request for
+    that pool name died on the one unentitled seat while the other seats stayed
+    idle and healthy, and each caller's session died on its first turn.
+
+    The router only offers a request to a seat whose `models:` covers the pool
+    name, so a denial of entitlement to that very model is about the seat's own
+    plan, not about the request => the long (exhaustion) tier + a switch, exactly
+    like spent quota; a plan state changes on the plan's own clock, not on ours.
+    What must NOT change: a 403 without that wording, a 403 for a request that
+    named no model this seat maps, and the 401 credential class.
+    """
+
+    fixture_kwargs = {"defaults": {"blacklist_exhausted": "3600",
+                                   "blacklist_failure": "60"}}
+    # verbatim upstream shape: a FLAT object (no {"error": …} envelope) whose
+    # wording is about entitlement, carrying neither a quota token nor a
+    # rate-limit phrase => no earlier tier can decide it
+    DENIED = json.dumps({
+        "message": ("Access to model denied. Please make sure you are eligible "
+                   "for using the model."),
+        "id": "00000000-0000-0000-0000-000000000000",
+        "type": "AccessDenied.Unpurchased",
+        "code": "AccessDenied.Unpurchased",
+    })
+
+    def test_an_entitlement_403_on_a_mapped_model_switches_and_takes_the_long_tier(self):
+        a, b, _c = self.mocks
+        a.script(mock.raw_error_spec(403, self.DENIED))
+        r = self.client.chat()
+        self.assertEqual(200, r.status, r.text())       # served by the next seat
+        self.assertEqual(1, a.count)
+        self.assertEqual(1, b.count)                    # switched in-request
+        self.assertIn("account=beta", self.fx.grep_log("REQ ok account=")[-1])
+        self.assertNotIn("Unpurchased", r.text())       # never relayed
+        line = self.fx.grep_log("EXHAUSTED_SWITCH")[0]
+        self.assertIn("account=alpha", line)
+        self.assertIn("status=403", line)
+        self.assertIn("phrase='unpurchased'", line)
+        self.assertIn("-> next account", line)
+        self.assertIn("blacklisted 3600s", line)        # the LONG tier
+        ex = self.fx.grep_log("ACCOUNT_EXHAUSTED")[0]
+        self.assertIn("account=alpha", ex)
+        self.assertIn("reason=exhausted", ex)
+        self.assertIn("blacklist_s=3600", ex)
+        view = self.fx.acct_view("alpha")
+        self.assertFalse(view["available"])
+        self.assertEqual("exhausted", view["reason"])   # not folded to transient
+        self.assertIsNotNone(view["until"])
+        # the two paths that must NOT fire on this class
+        self.assertFalse(self.fx.grep_log("CLIENT_ERROR", timeout=0.3))
+        self.assertFalse(self.fx.grep_log("UPSTREAM_ERROR", timeout=0.3))
+
+    def test_a_streamed_entitlement_403_switches_before_any_byte(self):
+        a, b, _c = self.mocks
+        a.script(mock.raw_error_spec(403, self.DENIED))
+        r = self.client.stream_chat()
+        self.assertEqual(200, r.status, r.text()[:400])
+        self.assertIn("[DONE]", r.text())
+        self.assertIn("part0", r.text())
+        self.assertEqual(1, a.count)
+        self.assertEqual(1, b.count)
+        self.assertEqual("exhausted", self.fx.acct_view("alpha")["reason"])
+        self.assertIn("account=beta", self.fx.grep_log("REQ ok account=")[-1])
+        self.assertFalse(self.fx.grep_log("CLIENT_ERROR", timeout=0.3))
+
+    def test_the_unentitled_seat_is_skipped_by_the_next_request(self):
+        a, _b, _c = self.mocks
+        a.script(mock.raw_error_spec(403, self.DENIED))
+        self.assertEqual(200, self.client.chat().status)
+        self.assertEqual(1, a.count)
+        # the blacklist outlives the request that earned it: recovery stays lazy
+        self.assertEqual(200, self.client.chat().status)
+        self.assertEqual(1, a.count)
+        self.assertFalse(self.fx.acct_view("alpha")["available"])
+        self.assertEqual({"alpha": "exhausted"},
+                         dict((x["name"], x["reason"])
+                              for x in self.fx.model_entry()["accounts"]
+                              if not x["available"]))
+
+    def test_the_whole_pool_denying_entitlement_yields_503_exhausted_not_a_403(self):
+        for m in self.mocks:
+            m.script(mock.raw_error_spec(403, self.DENIED))
+        r = self.client.chat()
+        self.assertEqual(503, r.status)
+        body = r.json()
+        self.assertEqual("all_accounts_exhausted", body["error"]["type"])
+        self.assertEqual(["exhausted"] * 3,
+                         [x["reason"] for x in body["error"]["accounts"]])
+        self.assertNotIn("Unpurchased", r.text())
+        self.assertEqual(3, len(self.fx.grep_log("EXHAUSTED_SWITCH")))
+        self.assertEqual(0, self.fx.pool_view()["accounts_available"])
+        self.assertTrue(self.fx.grep_log("POOL_EXHAUSTED"))
+
+    def test_a_plain_403_on_a_mapped_model_is_still_returned_to_the_client(self):
+        """The rule needs the entitlement wording, not the status code."""
+        a, b, _c = self.mocks
+        a.script(mock.raw_error_spec(403, '{"code":"403","message":"forbidden"}'))
+        r = self.client.chat()
+        self.assertEqual(403, r.status)
+        self.assertIn("forbidden", r.text())            # relayed verbatim
+        self.assertEqual(1, a.count)
+        self.assertEqual(0, b.count)                    # no pointless switch
+        line = self.fx.grep_log("CLIENT_ERROR")[0]
+        self.assertIn("account=alpha", line)
+        self.assertIn("status=403", line)
+        self.assertIn("no account switch, no blacklist", line)
+        self.assertTrue(self.fx.acct_view("alpha")["available"])
+        self.assertFalse(self.fx.grep_log("ACCOUNT_EXHAUSTED", timeout=0.3))
+        self.assertFalse(self.fx.grep_log("ACCOUNT_BLACKLISTED", timeout=0.3))
+
+    def test_an_entitlement_403_for_a_model_less_request_stays_client_side(self):
+        a, b, _c = self.mocks
+        a.script(mock.raw_error_spec(403, self.DENIED))
+        r = self.client.post(CHAT, {"messages": [{"role": "user", "content": "hi"}]})
+        self.assertEqual(403, r.status)
+        self.assertEqual(1, a.count)
+        self.assertEqual(0, b.count)
+        self.assertTrue(self.fx.acct_view("alpha")["available"])
+        self.assertFalse(self.fx.grep_log("ACCOUNT_EXHAUSTED", timeout=0.3))
+
+    def test_a_401_keeps_the_credential_class_even_with_entitlement_wording(self):
+        """401 = the upstream refused OUR key: short tier, and no exhaustion."""
+        a, b, _c = self.mocks
+        a.script(mock.raw_error_spec(401, self.DENIED))
+        r = self.client.chat()
+        self.assertEqual(200, r.status, r.text())
+        self.assertEqual(1, b.count)
+        line = self.fx.grep_log("UPSTREAM_KEY_REJECTED")[0]
+        self.assertIn("account=alpha", line)
+        self.assertIn("blacklisted 60s", line)          # the SHORT tier
+        bl = self.fx.grep_log("ACCOUNT_BLACKLISTED")[0]
+        self.assertIn("reason=upstream_key_rejected", bl)
+        self.assertNotIn("Unpurchased", r.text())       # the body is never leaked
+        self.assertFalse(self.fx.grep_log("ACCOUNT_EXHAUSTED", timeout=0.3))
         self.assertEqual([], self.fx.stray_files())
 
 

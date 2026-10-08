@@ -456,8 +456,10 @@ class RouterHandler(BaseHTTPRequestHandler):
             # `up_model` is this account's own mapping of the requested pool
             # model: when it exists, an upstream 404 means the account cannot
             # serve a model it claims to serve (account-side fault -> switch),
-            # while a 404 for a request that named no model stays a path-level
-            # client error (see classify.classify).
+            # and so does a denial of entitlement to that very model (a 403
+            # `…Unpurchased` family -> the long exhaustion tier + a switch);
+            # without the mapping both stay client errors about the request's
+            # own shape (see classify.classify).
             category, evidence = classify.classify(
                 status, err_text, mapped_model=up_model is not None)
             redacted = app.secrets.redact(err_text)[:200]

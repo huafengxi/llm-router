@@ -3,9 +3,9 @@
 An OpenAI-compatible reverse proxy that aggregates several **independently
 quota'd** upstream accounts behind one endpoint: a request walks the account
 list in its writing order, and when the upstream signals that the current
-account is at fault (spent quota, rate limit, 5xx, refused credential, empty
-stream, a 404 for a model it maps) the **same request** is retried on the next
-account. Clients see one
+account is at fault (spent quota, a lapsed entitlement to a model it maps, rate
+limit, 5xx, refused credential, empty stream, a 404 for a model it maps) the
+**same request** is retried on the next account. Clients see one
 base URL and one model namespace; the pool absorbs the account-level failures.
 
 Protocol passthrough only — no protocol translation, no request rewriting
@@ -150,27 +150,34 @@ them in ascending `order`, skipping any still inside its blacklist window.
 | upstream **401** (our credential refused) | `upstream_key_rejected` | `blacklist_failure` | switch (the upstream 401 body is never leaked; if every account refuses, 503 `all_accounts_exhausted`) | `UPSTREAM_KEY_REJECTED` |
 | key undecryptable | `key_error` | `blacklist_failure` | switch | `KEY_ERROR` |
 | upstream **404** for a pool model **this account maps** (its mapping drifted, or its upstream plan changed) | `server_error` | `blacklist_failure` | switch — the account cannot serve what it claims to serve | `UPSTREAM_ERROR` (evidence `mapped_model=True`) |
+| upstream **denial of entitlement** to a pool model **this account maps** (an `AccessDenied.Unpurchased`-family 403: the plan lapsed or never covered it) | `exhausted` | `blacklist_exhausted` | switch — the account's own plan state, which changes on the plan's clock, not on ours | `ACCOUNT_EXHAUSTED` + `EXHAUSTED_SWITCH` (evidence `mapped_model=True phrase=…`) |
 | **2xx stream that never carries content nor `finish_reason`** (0 bytes, or role-only frames + `[DONE]`) | `server_error` | `blacklist_failure` | **switch** — decided by probing the stream head before the response is committed (`proxy.probe_stream_start`, 64KB cap); once a byte is written, no switch | `EMPTY_STREAM` / `STREAM_FIRST_BYTE_FAILED` |
-| other 4xx (400/403/405/413/415/422, and a 404 for a request that named **no** model this account maps — an upstream path it does not serve; a bare 402 without quota semantics falls to `unknown` and is handled like a 5xx) | — | **never blacklisted** (`last_error` only) | return to the client as-is, no switch (retrying would repeat the same error) | `CLIENT_ERROR` |
+| other 4xx (400/403/405/413/415/422, and a 404 — or an entitlement denial — for a request that named **no** model this account maps; a bare 402 without quota semantics falls to `unknown` and is handled like a 5xx) | — | **never blacklisted** (`last_error` only) | return to the client as-is, no switch (retrying would repeat the same error) | `CLIENT_ERROR` |
 
 **A status code alone is never the judgement.** Some upstreams answer both rate
 limiting and quota exhaustion with the same `Throttling.*Quota` family, so the
 response body's semantics are read first and the status code is only used as a
 second condition (table = `classify.py`; its `EXHAUSTED_PHRASES` / `QUOTA_TOKENS`
-constants collect real upstream wording and are pinned case-by-case in
-`test/test_router.py::T05ClassifyTable`).
+/ `MODEL_ACCESS_PHRASES` constants collect real upstream wording and are pinned
+case-by-case in `test/test_router.py::T05ClassifyTable`).
 
-**A 404 is split by routing context, not by wording.** The router only offers a
-request to an account whose `models:` covers the pool name, so a 404 from that
-upstream is the account's own fault — it cannot serve what it claims to serve —
-and the request switches. A 404 for a request that named no model is about the
-request's own shape (a path the upstream does not serve) and goes back to the
-client unchanged, because another account would answer it the same way. Judging
-the two apart by the upstream's phrasing instead would leave every wording not
+**A 404 and an entitlement denial are split by routing context, not by
+wording.** The router only offers a request to an account whose `models:` covers
+the pool name, so a 404 from that upstream is the account's own fault — it cannot
+serve what it claims to serve — and the request switches. The same holds when the
+upstream denies entitlement to that very model (an `AccessDenied.Unpurchased`
+family 403, which a plan boundary can produce after the spent-quota 429s stop):
+the seat's plan state is the account's fault, so it takes the **long** exhaustion
+tier — a plan changes on its own clock, and re-probing it every request would
+only re-lose requests. A 404 (or such a 403) for a request that named no model is
+about the request's own shape and goes back to the client unchanged, because
+another account would answer it the same way; so does any other 403, which stays a
+client error, and a 401, which stays the credential class whatever its body says.
+Judging these apart by the upstream's phrasing alone would leave every wording not
 yet invented on the client side: no switch and no blacklist, so the one account
-answering 404 keeps receiving every request for that pool name and the rest of
-the pool is never tried (`classify.classify(..., mapped_model=…)`, pinned by
-`test/test_router.py::T27Upstream404`).
+answering it keeps receiving every request for that pool name and the rest of the
+pool is never tried (`classify.classify(..., mapped_model=…)`, pinned by
+`test/test_router.py::T27Upstream404` and `::T28Upstream403Entitlement`).
 
 **Recovery is lazy and request-driven — there is no background thread.** Each
 request starts with one "expired ⇒ back to `ok`" pass (`ACCOUNT_RECOVERED`); the
@@ -298,6 +305,8 @@ empty stream / reject_stream_options …).
 | config edits do not take effect | `CONFIG_REJECTED` gives the validation reason (the old config is still running); `CONFIG_RELOADED` = accepted, with the account count |
 | reset a blacklist | restart (all state is in memory), or wait for that account's `until` |
 | `UPSTREAM_ERROR … status=404 mapped_model=True` repeats for one account | that upstream no longer serves the model this account maps it to (plan change, rename): the pool now routes around it for `blacklist_failure` seconds at a time — unmap the name in `accounts.yml` (hot reload), and probe with `probe_models.py` before mapping it again |
+| `ACCOUNT_EXHAUSTED … status=403 … mapped_model=True phrase='unpurchased'` | that account's plan does not (or no longer) cover the model it maps: the pool routes around it for `blacklist_exhausted` seconds at a time. Fix = renew the plan, or unmap the name in `accounts.yml` (hot reload) and re-probe with `probe_models.py` before mapping it again |
+| clients all die on their first turn while the pool looks healthy | a client-error class was relayed instead of switched: read the `CLIENT_ERROR` lines' account and status, then check whether that upstream wording belongs to an account-side class the table above does not know yet (`classify.py` is the table, `test/test_router.py::T05ClassifyTable` pins it case by case) |
 | 503 `all_accounts_exhausted` | read the `POOL_EXHAUSTED` line's per-account reasons, then decide: wait for recovery, fix a key, or add an account |
 | port taken | `BIND_FAILED`; `--port` overrides |
 

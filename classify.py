@@ -7,7 +7,8 @@ per-minute throttle would be booked as the long quota-exhaustion class.
 
 Categories (the caller, server.py, turns them into a blacklist duration and a
 switch decision; this module only classifies):
-  exhausted     account quota is spent -> the long blacklist, switch account
+  exhausted     account quota is spent, or the account is not entitled to a
+                model it maps -> the long blacklist, switch account
   throttled     rate limit -> the short blacklist, switch account
   server_error  5xx / network / timeout, and an upstream 404 for a pool model
                 this account maps -> the short blacklist, switch account
@@ -21,13 +22,16 @@ switch decision; this module only classifies):
                 another account would repeat it
   unknown       anything else -> treated like server_error
 
-A 404 is split by ROUTING CONTEXT, not by body wording: the router only offers a
-request to an account whose `models:` covers the pool name, so a 404 from that
-upstream means the account cannot serve a model it claims to serve (its mapping
-drifted, or its plan changed) — an account-side fault.  Matching the upstream's
-phrasing instead would leave every wording it has not yet invented classified as
-the client's fault, which pins the whole pool to the one account that answers
-404 (no switch, no blacklist, every request lost).
+Two 4xx classes are split by ROUTING CONTEXT, not by body wording: the router
+only offers a request to an account whose `models:` covers the pool name, so a
+404 — or a 403 denying entitlement to that very model — from that upstream means
+the account cannot serve a model it claims to serve (its mapping drifted, or its
+plan changed / lapsed) — an account-side fault.  Leaving them on the client side
+instead pins the whole pool to the one account that answers them: no switch, no
+blacklist, every request for that pool name lost while the healthy seats idle.
+The two classes differ only in how long the state lasts: a drifted mapping is
+fixed by a config reload (short tier), a lapsed entitlement lasts until the plan
+changes again (long tier, like spent quota).
 
 Python 3.8 syntax floor; stdlib only.
 """
@@ -98,6 +102,20 @@ EXHAUSTED_WORDS = (
 EXHAUSTED_STATUS = (402, 429, 403)
 CLIENT_ERROR_STATUS = (400, 401, 403, 404, 405, 413, 415, 422)
 
+# --- model-entitlement denial: the seat's plan does not cover a model it maps.
+# Consulted ONLY together with the caller's routing context (`mapped_model`) and
+# never for a 401 (that class is about our credential, not about the plan), so a
+# request-level 403 keeps its client-side meaning.  Wording collected from a real
+# upstream; the family is about entitlement, not about a spent balance, so no
+# quota token appears in it.
+MODEL_ACCESS_PHRASES = (
+    "unpurchased",
+    "access to model denied",
+    "eligible for using the model",
+    "没有使用该模型的权限",
+    "模型未开通",
+)
+
 EXHAUSTED = "exhausted"
 THROTTLED = "throttled"
 SERVER_ERROR = "server_error"
@@ -147,7 +165,8 @@ def classify(status, body, mapped_model=False):
     `mapped_model` is routing context from the caller: True when this account's
     `models:` mapping covers the pool model of the request (the account claimed
     to serve it), False when the request named no model / the account maps none.
-    It only matters for status 404.
+    It decides two classes: a 404 (mapping drift -> server_error) and a
+    model-entitlement denial (plan lapse -> exhausted).
 
     Precedence (the status code alone never decides):
       1 explicit quota-exhaustion wording            -> exhausted
@@ -157,7 +176,9 @@ def classify(status, body, mapped_model=False):
       5 bare 429                                     -> throttled
       6 5xx                                          -> server_error
       7 404 + mapped_model                           -> server_error
-      8 other 4xx / anything else
+      8 entitlement-denial wording + mapped_model,
+        not a 401                                    -> exhausted
+      9 other 4xx / anything else
     """
     low = _low(body)
     hit = _has(low, EXHAUSTED_PHRASES)
@@ -184,6 +205,13 @@ def classify(status, body, mapped_model=False):
     if code == 404 and mapped_model:
         return SERVER_ERROR, ("mapped_model=True (this account maps the pool "
                               "model, so the upstream 404 is its own fault)")
+    if code != 401 and mapped_model:
+        denied = _has(low, MODEL_ACCESS_PHRASES)
+        if denied:
+            return EXHAUSTED, ("status=%d mapped_model=True phrase=%r (this "
+                               "account maps the pool model, so the upstream "
+                               "denies its own entitlement to it)"
+                               % (code, denied))
     if code in CLIENT_ERROR_STATUS:
         return CLIENT_ERROR, "status=%d" % code
     if code:

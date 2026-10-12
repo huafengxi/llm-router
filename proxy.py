@@ -206,16 +206,28 @@ PROBE_CAP = 65536                 # buffered head bytes before giving up on the 
 def sse_line_progress(line):
     """-> True when one SSE `data:` line proves the stream is producing output.
 
-    Progress = a non-null `finish_reason`, any content / reasoning / tool_calls
-    delta, a completions-shaped `text` field, or a usage block.  Role-only
-    deltas, keep-alive comments, `[DONE]` and unparsable payloads are NOT
-    progress: a stream made only of those is the empty-stream fault.
+    Chat-completions wire: progress = a non-null `finish_reason`, any content /
+    reasoning / tool_calls delta, a completions-shaped `text` field, or a usage
+    block.  Role-only deltas, keep-alive comments, `[DONE]` and unparsable
+    payloads are NOT progress: a stream made only of those is the empty-stream
+    fault.
+
+    Responses wire (`/v1/responses`): frames carry `"type": "response.*"`
+    instead of `choices`.  Lifecycle-start frames (`response.created`,
+    `response.in_progress`, `response.queued`) are not progress; any other
+    `response.*` frame (output deltas, `response.completed`, and also
+    `response.failed` / `response.incomplete` — they carry the outcome the
+    client must see) is.
     """
     obj = _sse_payload(line)
     if not isinstance(obj, dict):
         return False
     if obj.get("usage"):
         return True
+    frame_type = obj.get("type")
+    if isinstance(frame_type, str) and frame_type.startswith("response."):
+        return frame_type not in ("response.created", "response.in_progress",
+                                  "response.queued")
     choices = obj.get("choices")
     if not isinstance(choices, list):
         return False

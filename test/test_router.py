@@ -26,7 +26,10 @@ rejected, T25 upstream 401 rejected, T26 empty stream with no finish_reason
 (200 + SSE frames that carry neither content nor a finish_reason => switch
 accounts while nothing has been written), T27 upstream 404 split by routing
 context (a 404 for a pool model the account maps => switch + short blacklist;
-a path-level 404 and the router's own no-mapping answer => unchanged).
+a path-level 404 and the router's own no-mapping answer => unchanged),
+T29 Responses-wire streams (the empty-stream probe reads `response.*` frame
+types: a stream that carried output deltas / a completion is relayed, a
+created-only stream switches accounts like its chat-shaped twin).
 """
 import http.client
 import json
@@ -196,6 +199,36 @@ class Client(object):
         hdrs.update(kw.pop("headers", None) or {})
         conn.request("POST", CHAT, body=json.dumps(body).encode("utf-8"),
                      headers=hdrs)
+        resp = conn.getresponse()
+        chunks = []
+        status = resp.status
+        headers = dict(resp.getheaders())
+        if status == 200:
+            end = time.time() + deadline
+            while time.time() < end:
+                try:
+                    piece = resp.read1(65536)
+                except Exception as e:
+                    chunks.append(b"<<READ_ERROR %s>>" % type(e).__name__.encode())
+                    break
+                if not piece:
+                    break
+                chunks.append(piece)
+        else:
+            chunks.append(resp.read())
+        conn.close()
+        return Response(status, headers, b"".join(chunks))
+
+    def stream_responses(self, model=MODEL, deadline=20):
+        """POST a streaming /v1/responses request (Responses wire)."""
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=deadline)
+        body = {"model": model, "stream": True, "store": False,
+                "input": [{"type": "message", "role": "user",
+                           "content": [{"type": "input_text", "text": "hi"}]}]}
+        hdrs = {"Content-Type": "application/json",
+                "Authorization": "Bearer " + (self.token or "")}
+        conn.request("POST", "/v1/responses",
+                     body=json.dumps(body).encode("utf-8"), headers=hdrs)
         resp = conn.getresponse()
         chunks = []
         status = resp.status
@@ -2479,6 +2512,51 @@ class T28Upstream403Entitlement(RouterCase):
         self.assertNotIn("Unpurchased", r.text())       # the body is never leaked
         self.assertFalse(self.fx.grep_log("ACCOUNT_EXHAUSTED", timeout=0.3))
         self.assertEqual([], self.fx.stray_files())
+
+
+class T29ResponsesWire(RouterCase):
+    """The empty-stream probe on the Responses wire (`/v1/responses`).
+
+    Responses SSE frames carry `"type": "response.*"` and never a
+    `finish_reason`; a probe that only reads chat-completions markers would
+    classify a perfectly good Responses stream as empty, blacklist the account
+    and 503 the client (first-hand: a Responses-wire account backed by a
+    subscription gateway, 2026-10-12).
+    """
+
+    def test_responses_stream_with_output_is_relayed_not_switched(self):
+        a, b, _c = self.mocks
+        a.script(mock.spec(responses_stream="ok"))
+        r = self.client.stream_responses()
+        self.assertEqual(200, r.status, r.text())
+        self.assertIn("response.output_text.delta", r.text())
+        self.assertIn("response.completed", r.text())
+        self.assertEqual(1, a.count)                # no switch, no blacklist
+        self.assertEqual(0, b.count)
+        self.assertEqual("ok", self.fx.acct_view("alpha")["reason"])
+
+    def test_responses_created_only_stream_switches_account(self):
+        a, b, _c = self.mocks
+        a.script(mock.spec(responses_stream="empty"))
+        r = self.client.stream_responses()
+        self.assertEqual(200, r.status, r.text())   # b relays its own stream
+        self.assertEqual(1, a.count)
+        self.assertEqual(1, b.count)
+        line = self.fx.grep_log("EMPTY_STREAM")[-1]
+        self.assertIn("account=alpha", line)
+
+    def test_progress_markers_are_read_per_wire(self):
+        probe = proxy_mod.sse_line_progress
+
+        def frame(t, extra=""):
+            return ('data: {"type": "%s"%s}\n' % (t, extra)).encode()
+        self.assertFalse(probe(frame("response.created")))
+        self.assertFalse(probe(frame("response.in_progress")))
+        self.assertFalse(probe(frame("response.queued")))
+        self.assertTrue(probe(frame("response.output_text.delta",
+                                    ', "delta": "x"')))
+        self.assertTrue(probe(frame("response.completed")))
+        self.assertTrue(probe(frame("response.failed")))
 
 
 if __name__ == "__main__":

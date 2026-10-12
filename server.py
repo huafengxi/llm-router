@@ -119,6 +119,8 @@ class RouterHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", content_type)
         self.send_header("Cache-Control", "no-cache")
         for key, value in (extra_headers or []):
+            if key.lower() == "content-type":
+                continue          # already sent explicitly above (no duplicate)
             self.send_header(key, value)
         self.send_header("Transfer-Encoding", "chunked")
         self.end_headers()

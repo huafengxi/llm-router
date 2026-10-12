@@ -23,6 +23,10 @@ Behaviour is scripted per request (a queue of specs, then a default):
     no_finish: bool       stream: SSE frames that carry neither content nor a
                           finish_reason, then close (the "200 + empty stream"
                           fault: bytes arrive, the client would die)
+    responses_stream: str stream in Responses-wire SSE frames instead of the
+                          chat-completions shape: "ok" = created → deltas →
+                          completed; "empty" = created only then EOF (the same
+                          fault, Responses-shaped: no progress marker ever)
     abrupt: bool          with break_after: close without the terminating chunk
                           (the router sees an IncompleteRead mid-stream)
     quota_text: str       the error message used by break_after / kind "error"
@@ -57,7 +61,7 @@ def spec(**kw):
             "usage_chunk": None, "reject_stream_options": False, "delay": 0.0,
             "break_after": None, "abrupt": False, "quota_text": DEFAULT_QUOTA_TEXT,
             "content": "pong", "empty_stream": False, "no_finish": False,
-            "raw_body": None}
+            "responses_stream": None, "raw_body": None}
     base.update(kw)
     return base
 
@@ -192,6 +196,33 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-cache")
         self.send_header("Transfer-Encoding", "chunked")
         self.end_headers()
+        if s.get("responses_stream"):
+            # Responses-wire SSE (`/v1/responses` frame shapes): "ok" =
+            # created → output_text.delta → completed; "empty" = created
+            # only, then EOF (the empty-stream fault in Responses shape —
+            # lifecycle-start frames are not progress).
+            def _rframe(t, extra=None):
+                obj = {"type": t, "sequence_number": 0}
+                obj.update(extra or {})
+                return ("event: %s\ndata: %s\n\n"
+                        % (t, json.dumps(obj))).encode("utf-8")
+            self._chunk(_rframe("response.created",
+                                {"response": {"id": "resp_mock",
+                                              "status": "in_progress"}}))
+            if s["responses_stream"] == "ok":
+                self._chunk(_rframe("response.output_text.delta",
+                                    {"delta": "PO"}))
+                self._chunk(_rframe("response.output_text.delta",
+                                    {"delta": "NG"}))
+                self._chunk(_rframe("response.completed",
+                                    {"response": {
+                                        "id": "resp_mock",
+                                        "status": "completed",
+                                        "usage": {"input_tokens": 5,
+                                                  "output_tokens": 2}}}))
+            self.wfile.write(b"0\r\n\r\n")
+            self.wfile.flush()
+            return
         if s.get("empty_stream"):
             # 200 + headers and an immediately terminated body: the router must
             # treat "nothing arrived" as retryable (no byte reached the client)

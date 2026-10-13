@@ -122,11 +122,6 @@ SERVER_ERROR = "server_error"
 CLIENT_ERROR = "client_error"
 UNKNOWN = "unknown"
 
-# network-level exception types that mean "this account could not be reached"
-NETWORK_HINTS = ("timeout", "timed out", "refused", "reset", "eof", "broken",
-                 "unreachable", "name or service not known", "temporarily",
-                 "ssl", "certificate", "incomplete", "closed")
-
 
 def _low(text):
     if text is None:
@@ -225,7 +220,4 @@ def classify_exception(exc):
     low = _low(text)
     if has_quota_semantics(low):        # e.g. an SSL body is never quota text
         return EXHAUSTED, text[:200]
-    for hint in NETWORK_HINTS:
-        if hint in low:
-            return SERVER_ERROR, text[:200]
     return SERVER_ERROR, text[:200]

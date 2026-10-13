@@ -1,7 +1,7 @@
 # llm-router
 
-An OpenAI-compatible reverse proxy that aggregates several **independently
-quota'd** upstream accounts behind one endpoint: a request walks the account
+An OpenAI-compatible reverse proxy that aggregates several independently
+quota'd upstream accounts behind one endpoint: a request walks the account
 list in its writing order, and when the upstream signals that the current
 account is at fault (spent quota, a lapsed entitlement to a model it maps, rate
 limit, 5xx, refused credential, empty stream, a 404 for a model it maps) the
@@ -33,10 +33,10 @@ service manager needs no working-directory setting.
 
 ## Configuration
 
-`accounts.yml` is the single configuration face and is **hot-reloaded on mtime
-change**: adding/removing an account, reordering the rotation, retuning the
+`accounts.yml` is the single configuration face and is hot-reloaded on mtime
+change: adding/removing an account, reordering the rotation, retuning the
 blacklist windows or the timeouts all take effect without a restart. A reload
-that fails validation is **refused** — the previous configuration stays in
+that fails validation is refused — the previous configuration stays in
 effect and a `CONFIG_REJECTED` line is logged. `accounts.example.yml` is the
 annotated reference shape.
 
@@ -61,8 +61,8 @@ ordinary pool names, there is no separate alias mechanism.
 
 ## Credentials
 
-**No credential ever appears in this file, and this repo never reads one from
-disk.** A credential is an **environment variable, referenced by name**
+No credential ever appears in this file, and this repo never reads one from
+disk. A credential is an environment variable, referenced by name
 (`key: ACME_API_KEY`, `auth: {token: ROUTER_TOKEN}`) and `secrets.py` — the
 single choke point — looks it up in the router's own environment. How a
 deployment obtains those values is deliberately not this package's business: it
@@ -89,7 +89,7 @@ Two consequences of reading the environment instead of a file:
 Plaintext values live only in the process environment and in `secrets.py`'s
 redaction registry; everything that leaves the process (log lines, response
 bodies) passes through `mask()`/`redact()` first. After the refactor the router
-spawns **no subprocess at all**, so no child inherits the credentials either.
+spawns no subprocess at all, so no child inherits the credentials either.
 
 | Environment variable | Meaning | Default |
 |---|---|---|
@@ -123,12 +123,12 @@ the token strong and treat its disclosure as a rotation event.
 | Method & path | Semantics |
 |---|---|
 | `POST /v1/chat/completions` | main path: pick candidates from the body's `model`, map the model name, pass through; `stream: true` relays SSE |
-| `GET /v1/models` | **aggregated locally** (not forwarded): the union of pool model names, each annotated per account with `available` / `upstream_model` / `reason` (`ok`\|`exhausted`\|`throttled`\|`key_error`\|`no_mapping`) and, while blacklisted, `until` |
+| `GET /v1/models` | aggregated locally (not forwarded): the union of pool model names, each annotated per account with `available` / `upstream_model` / `reason` (`ok`\|`exhausted`\|`throttled`\|`key_error`\|`no_mapping`) and, while blacklisted, `until` |
 | `GET /health` | liveness + pool summary (probe semantics: 200 even when the whole pool is unavailable — the state is in the body's `pool` field) |
 | other `/v1/*` | generic passthrough with the same account selection (embeddings etc. do not 404); nothing rewritten except the model mapping and `stream_options` |
 | anything else | 404 + JSON error (401 first when unauthenticated) |
 
-The `reason` values above are a **folded** public enumeration: the two
+The `reason` values above are a folded public enumeration: the two
 credential classes (unresolvable key variable / upstream refusing our key) both
 surface as `key_error`, and the short-window transient class (throttle, 5xx, network
 error, unknown status) surfaces as `throttled` with the exact recovery instant
@@ -143,16 +143,16 @@ them in ascending `order`, skipping any still inside its blacklist window.
 | Upstream outcome | internal reason | blacklist window | action for this request | log tag |
 |---|---|---|---|---|
 | 2xx | — | cleared | return to client | `REQ ok` |
-| **quota exhausted** (semantic phrase family, or 402/429/403 *plus* quota semantics) | `exhausted` | `blacklist_exhausted` | **switch to the next candidate immediately** | `ACCOUNT_EXHAUSTED` + `EXHAUSTED_SWITCH` |
-| **rate limited** (rate limit / rpm / tpm / too many requests, no quota semantics) | `throttled` | `blacklist_failure` | switch immediately (no same-account backoff) | `THROTTLED_SWITCH` |
+| quota exhausted (semantic phrase family, or 402/429/403 *plus* quota semantics) | `exhausted` | `blacklist_exhausted` | switch to the next candidate immediately | `ACCOUNT_EXHAUSTED` + `EXHAUSTED_SWITCH` |
+| rate limited (rate limit / rpm / tpm / too many requests, no quota semantics) | `throttled` | `blacklist_failure` | switch immediately (no same-account backoff) | `THROTTLED_SWITCH` |
 | 5xx / unknown status | `server_error` | `blacklist_failure` | switch | `UPSTREAM_ERROR` |
 | connection error / timeout | `server_error` | `blacklist_failure` | switch | `UPSTREAM_UNREACHABLE` |
-| upstream **401** (our credential refused) | `upstream_key_rejected` | `blacklist_failure` | switch (the upstream 401 body is never leaked; if every account refuses, 503 `all_accounts_exhausted`) | `UPSTREAM_KEY_REJECTED` |
+| upstream 401 (our credential refused) | `upstream_key_rejected` | `blacklist_failure` | switch (the upstream 401 body is never leaked; if every account refuses, 503 `all_accounts_exhausted`) | `UPSTREAM_KEY_REJECTED` |
 | key undecryptable | `key_error` | `blacklist_failure` | switch | `KEY_ERROR` |
-| upstream **404** for a pool model **this account maps** (its mapping drifted, or its upstream plan changed) | `server_error` | `blacklist_failure` | switch — the account cannot serve what it claims to serve | `UPSTREAM_ERROR` (evidence `mapped_model=True`) |
-| upstream **denial of entitlement** to a pool model **this account maps** (an `AccessDenied.Unpurchased`-family 403: the plan lapsed or never covered it) | `exhausted` | `blacklist_exhausted` | switch — the account's own plan state, which changes on the plan's clock, not on ours | `ACCOUNT_EXHAUSTED` + `EXHAUSTED_SWITCH` (evidence `mapped_model=True phrase=…`) |
-| **2xx stream that never carries content nor `finish_reason`** (0 bytes, or role-only frames + `[DONE]`) | `server_error` | `blacklist_failure` | **switch** — decided by probing the stream head before the response is committed (`proxy.probe_stream_start`, 64KB cap); once a byte is written, no switch | `EMPTY_STREAM` / `STREAM_FIRST_BYTE_FAILED` |
-| other 4xx (400/403/405/413/415/422, and a 404 — or an entitlement denial — for a request that named **no** model this account maps; a bare 402 without quota semantics falls to `unknown` and is handled like a 5xx) | — | **never blacklisted** (`last_error` only) | return to the client as-is, no switch (retrying would repeat the same error) | `CLIENT_ERROR` |
+| upstream 404 for a pool model this account maps (its mapping drifted, or its upstream plan changed) | `server_error` | `blacklist_failure` | switch — the account cannot serve what it claims to serve | `UPSTREAM_ERROR` (evidence `mapped_model=True`) |
+| upstream denial of entitlement to a pool model this account maps (an `AccessDenied.Unpurchased`-family 403: the plan lapsed or never covered it) | `exhausted` | `blacklist_exhausted` | switch — the account's own plan state, which changes on the plan's clock, not on ours | `ACCOUNT_EXHAUSTED` + `EXHAUSTED_SWITCH` (evidence `mapped_model=True phrase=…`) |
+| 2xx stream that never carries content nor `finish_reason` (0 bytes, or role-only frames + `[DONE]`) | `server_error` | `blacklist_failure` | switch — decided by probing the stream head before the response is committed (`proxy.probe_stream_start`, 64KB cap); once a byte is written, no switch | `EMPTY_STREAM` / `STREAM_FIRST_BYTE_FAILED` |
+| other 4xx (400/403/405/413/415/422, and a 404 — or an entitlement denial — for a request that named no model this account maps; a bare 402 without quota semantics falls to `unknown` and is handled like a 5xx) | — | never blacklisted (`last_error` only) | return to the client as-is, no switch (retrying would repeat the same error) | `CLIENT_ERROR` |
 
 **A status code alone is never the judgement.** Some upstreams answer both rate
 limiting and quota exhaustion with the same `Throttling.*Quota` family, so the
@@ -161,13 +161,13 @@ second condition (table = `classify.py`; its `EXHAUSTED_PHRASES` / `QUOTA_TOKENS
 / `MODEL_ACCESS_PHRASES` constants collect real upstream wording and are pinned
 case-by-case in `test/test_router.py::T05ClassifyTable`).
 
-**A 404 and an entitlement denial are split by routing context, not by
-wording.** The router only offers a request to an account whose `models:` covers
+A 404 and an entitlement denial are split by routing context, not by
+wording. The router only offers a request to an account whose `models:` covers
 the pool name, so a 404 from that upstream is the account's own fault — it cannot
 serve what it claims to serve — and the request switches. The same holds when the
 upstream denies entitlement to that very model (an `AccessDenied.Unpurchased`
 family 403, which a plan boundary can produce after the spent-quota 429s stop):
-the seat's plan state is the account's fault, so it takes the **long** exhaustion
+the seat's plan state is the account's fault, so it takes the long exhaustion
 tier — a plan changes on its own clock, and re-probing it every request would
 only re-lose requests. A 404 (or such a 403) for a request that named no model is
 about the request's own shape and goes back to the client unchanged, because
@@ -199,13 +199,13 @@ stream) ⇒ switching accounts and retrying is safe. Written ⇒ no retry: an
 to the SSE stream followed by `data: [DONE]` (never a fake success, never a
 silent truncation), logged as `STREAM_INTERRUPTED`. If the interrupted body
 carries quota semantics the account is still marked `exhausted` for later
-requests; a non-quota interruption blacklists **nothing**, because that branch
+requests; a non-quota interruption blacklists nothing, because that branch
 covers both "upstream stopped" and "client went away" and cannot tell them
 apart.
 
 ### `timeout` reach (read before tuning)
 
-`connect` is **not** just the TCP/TLS handshake: the connection is created with
+`connect` is not just the TCP/TLS handshake: the connection is created with
 `timeout=connect` and `getresponse()` still runs under it; only afterwards is the
 socket switched to `read`. So `connect` bounds handshake + sending the request
 body + waiting for the response headers (i.e. time-to-first-byte), and `read`
@@ -214,7 +214,7 @@ bounds the streamed body only. A TTFB overrun is reported by Python as
 expect that misleading wording in the log; it is classified as a connection-level
 timeout (`server_error` + the short window + switch).
 
-`duration_ms` in `REQ ok` is the **whole request** (entry to relay complete,
+`duration_ms` in `REQ ok` is the whole request (entry to relay complete,
 stream included), not the TTFB, so its percentiles cannot be used to size these
 two values. The log carries no TTFB field.
 
@@ -224,12 +224,12 @@ Before forwarding a streaming request the router injects
 `stream_options: {"include_usage": true}` unless the client already set it, so
 the upstream reports real usage in its final chunk — otherwise streamed requests
 would log `tokens=0/0`. This is the only body rewrite besides the model mapping.
-If the upstream answers **400** because of that field, it is dropped and the
+If the upstream answers 400 because of that field, it is dropped and the
 **same account** is retried once (that request logs `usage_source=missing`, tag
 `STREAM_OPTIONS_REJECTED`; a second 400 is returned to the client as-is).
 Disable with `defaults.inject_stream_options: false` (hot reload).
 
-Without usage the router logs `usage_source=missing` and does **no** local
+Without usage the router logs `usage_source=missing` and does no local
 token estimation (no tokenizer dependency, no invented numbers). It keeps no
 usage totals and persists nothing, so the `REQ ok` line is the only observation
 point — grep the log if you need cross-account accounting.
@@ -246,10 +246,10 @@ bearer credential.
 | `STARTED` / `LISTENING` / `SIGNAL` / `STOPPED` / `BIND_FAILED` | lifecycle; `STARTED` carries `accounts=` in rotation order, `LISTENING` the bound URL and the exempt paths, `SIGNAL` a graceful shutdown beginning, `BIND_FAILED` (ERROR) a taken port |
 | `REQ ok account=… model=… status=… tokens=<in>/<out> usage_source=… attempt=… duration_ms=… client=…` | one served request (streamed ones add `bytes=` = bytes written to the client) |
 | `ACCOUNT_EXHAUSTED` / `ACCOUNT_BLACKLISTED` / `ACCOUNT_RECOVERED` | blacklist and reset facts (`until` / `blacklist_s` / `reason` / masked evidence) |
-| `EXHAUSTED_SWITCH` / `THROTTLED_SWITCH` / `UPSTREAM_ERROR` / `UPSTREAM_UNREACHABLE` / `UPSTREAM_KEY_REJECTED` / `KEY_ERROR` / `CLIENT_ERROR` | the switching judgement per class (all with `attempt=` / `duration_ms=`). A quota switch logs **two** lines — the pool-side fact and the server-side switch — so grep both tags |
+| `EXHAUSTED_SWITCH` / `THROTTLED_SWITCH` / `UPSTREAM_ERROR` / `UPSTREAM_UNREACHABLE` / `UPSTREAM_KEY_REJECTED` / `KEY_ERROR` / `CLIENT_ERROR` | the switching judgement per class (all with `attempt=` / `duration_ms=`). A quota switch logs two lines — the pool-side fact and the server-side switch — so grep both tags |
 | `AUTH` / `ACCOUNT` | startup credential warm-up: the inbound token (masked hint) and one line per account (`order` / `base_url` / masked key / model count); an undecryptable key logs `KEY_ERROR` (WARN) while the others keep serving |
-| `STREAM_INTERRUPTED` | a stream broken **after** bytes were written (`bytes_sent=` / `usage_source=` / `quota_semantics=`) |
-| `EMPTY_STREAM` / `STREAM_FIRST_BYTE_FAILED` | a streamed failure **before** any byte ⇒ switch candidate |
+| `STREAM_INTERRUPTED` | a stream broken after bytes were written (`bytes_sent=` / `usage_source=` / `quota_semantics=`) |
+| `EMPTY_STREAM` / `STREAM_FIRST_BYTE_FAILED` | a streamed failure before any byte ⇒ switch candidate |
 | `CLIENT_GONE` | the upstream stream was fully relayed and `REQ ok` logged, and the client disappeared before the closing chunk (WARN) — not an account fault, nothing blacklisted |
 | `INTERNAL_ERROR` | an uncaught handler exception (ERROR, two lines: traceback + masked detail); the client only gets `500 {"error":{"type":"internal_error"}}` |
 | `POOL_EXHAUSTED` | whole pool unavailable (ERROR — the line to alert on) |
@@ -267,7 +267,7 @@ python3 probe_models.py probe PLAN.json         # chat/completions probes, max_t
 python3 probe_models.py one ACCT MODEL          # one ad-hoc probe
 ```
 
-Run it **before** repointing a pool name at a different upstream model, and after
+Run it before repointing a pool name at a different upstream model, and after
 a quota recovery: accounts rarely expose the same upstream names, and a blind
 repoint silently drops an account out of that name's candidate set. Its account
 table is derived from `accounts.yml` by a loud minimal line scanner (stdlib only,

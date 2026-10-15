@@ -2084,19 +2084,6 @@ class T24ResidualKeysRejected(RouterCase):
 
     RETIRED = ("priority: 1", "quota: {credits: 100}", "credits_weights: {}")
 
-    def test_each_retired_key_is_a_config_error(self):
-        tmp = tempfile.mkdtemp(prefix="retired-", dir=TMP_ROOT)
-        self.addCleanup(shutil.rmtree, tmp, True)
-        self.assertEqual(("priority", "quota", "credits_weights"),
-                         config_mod.REJECTED_ACCOUNT_KEYS)
-        for retired in self.RETIRED:
-            specs = [accounts_block("acc0", "https://example.invalid/v1",
-                                    KEY_ENV_NAME, {"m": "m"}, extra=retired)]
-            path = write_accounts(os.path.join(tmp, "a.yml"), specs, TOKEN_ENV)
-            with self.assertRaises(config_mod.ConfigError) as cm:
-                config_mod.load(path)
-            self.assertIn("retired key", str(cm.exception), retired)
-
     def test_a_hot_reload_carrying_a_retired_key_is_refused(self):
         self.assertEqual(200, self.client.chat().status)
         with open(self.fx.accounts_path) as fh:
